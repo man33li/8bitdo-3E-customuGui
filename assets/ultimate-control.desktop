@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ultimate Control
+Comment=Read-only controller tools and host-side gyro aiming for the Ultimate 3E
+Exec=ultimate-control
+Icon=ultimate-control
+Terminal=false
+Categories=Utility;Game;
+Keywords=8BitDo;Controller;Gamepad;Gyro;Bluetooth;
+StartupNotify=true
+StartupWMClass=ultimate-control

@@ -1,0 +1,14 @@
+/target/
+.nix-gcroots/
+result
+# Vendor software, firmware, artwork and decompiled code are never committed.
+*.appxbundle
+*.appx
+*.apk
+*.dat
+/reconstruction/*
+!/reconstruction/specs/
+# Local captures and profile backups (fixtures/ is the only tracked profile data).
+/*.bin
+/*.jsonl
+/*.json

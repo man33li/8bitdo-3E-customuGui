@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Ultimate Control</title>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#17212e"/>
+  <path d="M77 71h102c18 0 29 13 35 36l16 62c6 23-16 38-32 22l-27-26H85l-27 26c-16 16-38 1-32-22l16-62c6-23 17-36 35-36Z" fill="#e7edf5"/>
+  <path d="M70 99v40m-20-20h40" fill="none" stroke="#17212e" stroke-width="12" stroke-linecap="round"/>
+  <g fill="#25b8a6"><circle cx="182" cy="101" r="9"/><circle cx="201" cy="120" r="9"/><circle cx="163" cy="120" r="9"/><circle cx="182" cy="139" r="9"/></g>
+  <circle cx="103" cy="147" r="14" fill="#53677f"/><circle cx="145" cy="147" r="14" fill="#53677f"/>
+  <path d="m111 96 12-12 12 12m-12-12v35" fill="none" stroke="#25b8a6" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
