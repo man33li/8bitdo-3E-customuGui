@@ -15,23 +15,25 @@ impl App {
         ui.element("app",0,Style::row(Size::Grow,Size::Grow).background(BG),|ui|{
             if let Some(page)=ui.nav_sidebar(&PAGES,self.page,model.demo,profiles.is_some_and(|p|p.profile_bits.tournament())){self.page=page;}
             ui.element("workspace",0,Style::column(Size::Grow,Size::Grow).padding(24).gap(14),|ui|{
-                ui.page_header(PAGES[self.page],if model.demo{"Demo — no device I/O"}else if model.device.as_ref().is_some_and(|d|d.link==Link::Bluetooth)&&!BLE_WRITE_VERIFIED{"Bluetooth — read-only; edits staged locally"}else if model.device.as_ref().is_some_and(|d|d.link==Link::Wired){"Wired — gamepad input pauses briefly during reads/saves"}else if model.device.is_some(){"Connected — edits staged until Save"}else{"Connect receiver, wired USB or Bluetooth"});
+                ui.page_header(PAGES[self.page],if model.demo{"Demo — no device I/O"}else if model.device.as_ref().is_some_and(|d|d.link==Link::Bluetooth)&&!BLE_WRITE_VERIFIED{"Bluetooth — read-only; edits staged locally"}else if model.device.as_ref().is_some_and(|d|d.link==Link::Wired){"Wired — gamepad input pauses briefly during reads/saves"}else if model.device.is_some(){"Settings connected — edits staged until Save"}else if !model.input_devices.is_empty(){"Gamepad detected — controller settings not connected"}else{"Connect receiver, wired USB or Bluetooth"});
                 if let Some(message)=self.error.as_deref().or(model.notice.as_deref()){if ui.toast(message){self.error=None;action=Some(Action::DismissNotice);}}
                 if let Some(operation)=&model.operation{ui.progress("operation-progress",None,&operation.title);ui.text(&operation.detail,14,MUTED);}
                 let enabled=ui.enabled;ui.enabled&=model.operation.is_none();
                 ui.scroll("page-scroll",Style::column(Size::Grow,Size::Grow).gap(12),|ui|{
                     match self.page {
                         0=>{
-                            self.diagram(ui);
                             if let Some(d)=&model.device{
                                 ui.text(&d.name,24,TEXT);ui.text(format_args!("Link: {:?}   Logical PID: {:04x}",d.link,d.pid),16,MUTED);
                                 if let Some(battery)=model.battery(){ui.text(format_args!("Battery: {} ({})",battery.level,battery.status),16,MUTED);}
                                 ui.text("Firmware version: decoder not established for this link.",15,MUTED);
                                 if let Some(record)=&d.version_record{ui.text(format_args!("Version record: {record}"),14,MUTED);}
                             }
-                            else{ui.text("Connect an awake receiver or one wired 2dc8:202f device (including an Xbox-mode receiver), or use Bluetooth configuration. Wired reads/saves pause gamepad input briefly.",18,TEXT);}
-                            if model.device.is_none()&&!model.demo{
-                                ui.text("Bluetooth: hold the front pixel-logo/profile button for 3 seconds until configuration LEDs blink, then connect. Close the mobile app.",16,TEXT);
+                            else if !model.input_devices.is_empty(){
+                                ui.text("Controller gamepad input detected",24,TEXT);
+                                ui.text("Input and settings are separate connections. PC-mode cable and firmware 1.38 may not answer USB settings requests; use Bluetooth configuration below without changing gameplay mode.",16,MUTED);
+                            }else{ui.text("Connect an awake receiver or wired USB controller, or use Bluetooth configuration. Wired Xbox-mode reads/saves pause gamepad input briefly.",18,TEXT);}
+                            if !model.device.as_ref().is_some_and(|device|device.link==Link::Bluetooth)&&!model.demo{
+                                ui.text("Keep the cable/receiver connected. Hold the front pixel-logo/profile button for 3 seconds until configuration LEDs blink, then Connect Bluetooth. Close the mobile app.",16,TEXT);
                                 let enabled=ui.enabled;ui.enabled&=model.can_connect_bluetooth();
                                 if ui.button("connect-bluetooth",0,"Connect Bluetooth",false){action=Some(Action::ConnectBluetooth);}
                                 ui.enabled=enabled;
@@ -57,6 +59,7 @@ impl App {
                             self.host_status(ui,model);
                             ui.text("Remap edits host-only controls. Starting grabs physical input and creates virtual gamepad / keyboard / mouse devices; stopping releases them.",14,MUTED);
                             if ui.button("refresh",0,"Re-read controller",false){action=Some(Action::Refresh);}
+                            self.diagram(ui);
                         },
                         1=>if let Some(p)=profile{
                             self.diagram(ui);
@@ -304,7 +307,11 @@ impl App {
         let enabled=ui.enabled;ui.enabled&=!model.mapper_running&&!model.mapper_pending;
         let mut profile=std::borrow::Cow::Borrowed(&model.host_profile);let mut changed=false;
         if cfg!(target_os="linux"){
-            if let Some(value)=ui.toggle("host-steam",0,"Steam Input (virtual DualSense Edge)",profile.steam){profile.to_mut().steam=value;changed=true;}
+            if let Some(value)=ui.toggle("host-steam",0,"Steam Input (virtual DualSense Edge)",profile.steam){
+                let profile=profile.to_mut();profile.steam=value;
+                if value{profile.native_gyro_clutch=false;}
+                changed=true;
+            }
             if profile.steam{ui.text("Steam does remapping and gyro: host remaps, layers and host gyro output below are ignored; the controller slot's key map still applies. L4/R4 → Edge Fn buttons, PL/PR → back paddles. 2.4 GHz gyro needs \"2.4 GHz gyro clutch\" on (Motion target Mouse, level 6). Needs /dev/uhid access.",14,MUTED);}
         }
         let sources:[&str;input::SOURCE_KEYS.len()]=std::array::from_fn(|index|input::SOURCE_KEYS[index].0);
@@ -378,21 +385,49 @@ impl App {
             }
             if trigger_changed{if index==0{controls_mut!(trigger_buttons).left=trigger;}else{controls_mut!(trigger_buttons).right=trigger;}changed=true;}
         }
-        let receiver=match model.device.as_ref(){Some(device)=>device.link==Link::Receiver,None=>model.mapper_device().is_ok_and(|device|device.link==input::LinkKind::Receiver)};
-        ui.text(if receiver{"Receiver gyro (all layers)"}else{"Bluetooth gyro (all layers)"},20,TEXT);
+        let receiver_available=model.input_devices.iter().any(|device|device.link==input::LinkKind::Receiver)
+            ||model.device.as_ref().is_some_and(|device|device.link==Link::Receiver);
+        let receiver=model.mapper_device().map_or(receiver_available,|device|device.link==input::LinkKind::Receiver);
+        ui.text("Gyro clutch (all layers)",20,TEXT);
         let receiver_buttons:[&str;input::RECEIVER_CLUTCH_KEYS.len()]=std::array::from_fn(|index|input::RECEIVER_CLUTCH_KEYS[index].0);
-        if receiver{
-            if let Some(value)=ui.toggle("host-receiver-gyro",0,"2.4 GHz gyro clutch",profile.receiver_gyro){
-                let profile=profile.to_mut();profile.receiver_gyro=value;
-                if value&&!receiver_buttons.contains(&profile.button.as_str()){profile.button="R4".into();}
+        let paddle_buttons=&["R4","L4","PL","PR"];
+        if receiver_available||profile.native_gyro_clutch{
+            if let Some(value)=ui.toggle("host-native-gyro",0,"USB / 2.4 GHz native-stick clutch (Bluetooth-assisted)",profile.native_gyro_clutch){
+                let profile=profile.to_mut();profile.native_gyro_clutch=value;
+                if value{
+                    profile.receiver_gyro=false;profile.gyro_mouse=None;profile.steam=false;
+                    if !paddle_buttons.contains(&profile.button.as_str()){profile.button="R4".into();}
+                }
                 changed=true;
             }
-            ui.text("Motion target must be Mouse: enable it once with press-toggle, or hold its enable button. The consumed clutch suspends firmware mouse input while held.",14,MUTED);
-            ui.text("Physical L4/R4/PL/PR work directly, without firmware remapping. With the mapper stopped, enabled firmware motion moves the desktop cursor.",14,MUTED);
-        }else{
-            ui.text("Holding the clutch disables Bluetooth gyro. Wired has no raw IMU or host gyro clutch.",14,MUTED);
         }
-        let gyro_enabled=ui.enabled;ui.enabled&=!receiver||profile.receiver_gyro;
+        let gyro_enabled=ui.enabled;
+        if profile.native_gyro_clutch{
+            ui.text("Requires the PC's Bluetooth adapter even with USB. The GUI reuses its settings connection; if not connected, hold the profile button ~3 s until LEDs blink before starting.",14,MUTED);
+            ui.text("Controller setup: Motion target Right stick, press-toggle on a different button (e.g. PL); leave the clutch paddle unmapped. Save, power-cycle, select that slot, then press the enable button once.",14,MUTED);
+            ui.text("Released: original USB stick plus firmware gyro. Held: only the physical right stick from Bluetooth. That physical stream has 8-bit resolution and lower update rate; all other USB controls pass through.",14,MUTED);
+            ui.text("Tune gyro sensitivity on the controller's Motion page; host raw-gyro filters do not apply to this native-stick source. Stop mapping before changing controller slots.",14,MUTED);
+            if cfg!(windows){ui.text("Windows requires ViGEmBus and HidHide. Setup is explicit; the app never installs drivers or disables Windows security.",14,MUTED);}
+            if let Some(index)=ui.dropdown("host-gyro-clutch",0,paddle_buttons,paddle_buttons.iter().position(|button|*button==profile.button).unwrap_or(usize::MAX)){
+                profile.to_mut().button=paddle_buttons[index].into();changed=true;
+            }
+        }else{
+        if receiver{
+            if cfg!(target_os="linux"){
+                if let Some(value)=ui.toggle("host-receiver-gyro",0,"Firmware-mouse gyro clutch (Linux)",profile.receiver_gyro){
+                    let profile=profile.to_mut();profile.receiver_gyro=value;
+                    if value&&!receiver_buttons.contains(&profile.button.as_str()){profile.button="R4".into();}
+                    changed=true;
+                }
+                ui.text("Legacy path: Motion target Mouse, level 6, enabled once by press-toggle. Firmware 1.38 may not expose receiver paddles; use Bluetooth-assisted native-stick clutch above for physical R4.",14,MUTED);
+                ui.text("With the mapper stopped, enabled firmware mouse gyro moves the desktop cursor.",14,MUTED);
+            }else{
+                ui.text("For USB/cable and 2.4 GHz, enable Bluetooth-assisted native-stick clutch above. Firmware-mouse capture is not supported on Windows.",14,MUTED);
+            }
+        }else{
+            ui.text("Bluetooth gaming input supplies raw gyro; the separate configuration Bluetooth link supplies the physical clutch. Xbox/GIP mode has no gyro.",14,MUTED);
+        }
+        ui.enabled&=!receiver||profile.receiver_gyro;
         if let Some(value)=ui.segmented("host-gyro-output",&["Right stick","Mouse"],usize::from(profile.gyro_mouse.is_some())){
             profile.to_mut().gyro_mouse=if value==1{Some(input::GyroMouse{sensitivity:1.0,deadzone:profile.deadzone,invert_x:profile.invert_x,invert_y:profile.invert_y})}else{None};changed=true;
         }
@@ -428,7 +463,8 @@ impl App {
         if let Some(value)=ui.range("host-gyro-smooth-threshold",0,"Smoothing threshold (deg/s)",gyro.smooth_threshold.round().clamp(0.0,100.0)as u8,0,100,false,0){gyro.smooth_threshold=f64::from(value);edited=true;}
         if let Some(value)=ui.range("host-gyro-smooth-time",0,"Smoothing window (ms)",gyro.smooth_time_ms.round()as u8,0,250,false,0){gyro.smooth_time_ms=f64::from(value);edited=true;}
         if edited{profile.to_mut().gyro=gyro;changed=true;}
-        ui.text("Slot mappings apply before host mappings. Profile-button slot changes are invisible: stop, Refresh, then restart mapping.",14,MUTED);
+        }
+        ui.text("Controller slot changes require stopping and restarting the mapper. Bluetooth-assisted native-stick mode preserves firmware mappings; other mapped paths reapply the last-read slot map.",14,MUTED);
         ui.enabled=gyro_enabled;
         if ui.button("save-host-profile",0,"Save host profile",true){*action=Some(Action::SaveHostProfile);}
         if changed{*action=Some(Action::SetHostProfile(Box::new(profile.into_owned())));}
@@ -538,10 +574,39 @@ impl App {
                 for (index,(label,key)) in [("L4",PhysicalButtons::L4),("R4",PhysicalButtons::R4),("PL (P1)",PhysicalButtons::P1),("PR (P2)",PhysicalButtons::P2)].into_iter().enumerate(){ui.button("test-paddle",index as u32,label,model.paddles&key.bits()!=0);}
                 ui.enabled=enabled;
             });
-            ui.text(if link==Some(Link::Receiver){"Receiver paddles use physical reports enabled by the Windows 400-ms heartbeat, not XInput residue. Live GUI check pending."}else{"Bluetooth physical input is change-driven; silence is normal, not a disconnect. Paddles are independent of stored mappings."},15,MUTED);
+            ui.text(if link==Some(Link::Receiver){"Receiver paddles use physical reports enabled by the Windows 400-ms heartbeat, not XInput residue."}else{"Bluetooth physical input is change-driven; silence is normal, not a disconnect. Paddles are independent of stored mappings."},15,MUTED);
         }else{
             ui.text("Verified XInput bits only. P1/P2/L4/R4/Profile and raw IMU are unproven in this stream; states are not fabricated.",15,MUTED);
         }
+        self.test_motion(ui,model,link);
+    }
+    fn test_motion(&mut self,ui:&mut Ui<'_,'_>,model:&Model,link:Option<Link>){
+        ui.text("Motion",20,TEXT);
+        let Some(m)=model.motion else{
+            ui.text(match link{
+                Some(Link::Wired)=>"Xbox mode (GIP) sends no motion data.",
+                Some(Link::Receiver)=>"The receiver has no raw gyro. To see motion here, set the slot's Motion target to Mouse and turn it on with its enable button; a right-stick target shows on the right-stick plot instead. A running host mapper captures this data.",
+                _=>"Waiting for motion data: Bluetooth needs the controller's gaming connection (paired in system Bluetooth settings).",
+            },15,MUTED);
+            return;
+        };
+        let [x,y,z]=m.gyro_dps;
+        // Plot: yaw horizontal, pitch vertical, full scale ±500 °/s. Bluetooth Y/Z are the
+        // pitch/yaw axes the host gyro uses (report bytes 23/25); raw +Z = turning left (live).
+        let (h,v)=if model.motion_from_mouse{(y,x)}else{(-z,y)};
+        ui.element("motion-row",0,Style::row(Size::Grow,Size::Fit).gap(24),|ui|{
+            ui.plot("gyro-live",0,(h/500.0).clamp(-1.0,1.0),(-v/500.0).clamp(-1.0,1.0));
+            ui.element("motion-values",0,Style::column(Size::Grow,Size::Fit).gap(8),|ui|{
+                if model.motion_from_mouse{
+                    ui.text(format_args!("Pitch {x:7.1} °/s    Yaw {y:7.1} °/s"),17,TEXT);
+                    ui.text("Firmware gyro-as-mouse output (Motion target Mouse), converted at 308 counts/° (calibrated at Motion level 6). No roll or accelerometer on this link.",14,MUTED);
+                }else{
+                    ui.text(format_args!("Gyro  X {x:7.1}   Y {y:7.1}   Z {z:7.1}  °/s"),17,TEXT);
+                    if let Some([ax,ay,az])=m.accel_g{ui.text(format_args!("Accel X {ax:6.2}   Y {ay:6.2}   Z {az:6.2}  g"),17,TEXT);}
+                    ui.text("Raw Bluetooth IMU. Lying still: gyro near 0, accelerometer ≈1 g on the vertical axis.",14,MUTED);
+                }
+            });
+        });
     }
 }
 fn unavailable(ui:&mut Ui<'_,'_>){ui.text("Profile data unavailable",23,TEXT);ui.text("Connect and read a controller profile before editing.",17,MUTED);}
@@ -814,6 +879,8 @@ mod remap_tests {
         assert!(!frame(&mut app,&mut clay,&mut focus,&mut model,Input::default()));
         assert_eq!(model.host_profile.button,"R4");
         assert!(!model.host_profile.receiver_gyro);
+        let dropdown=clay::id("host-gyro-clutch",0).id;
+        if cfg!(target_os="linux"){
         focus.selected=clay::id("host-receiver-gyro",0).id;
         assert!(frame(&mut app,&mut clay,&mut focus,&mut model,Input{activate:true,..Input::default()}));
         assert!(model.host_profile.receiver_gyro);
@@ -821,7 +888,6 @@ mod remap_tests {
         focus.selected=clay::id("host-gyro-stick-speed",0).id;
         assert!(frame(&mut app,&mut clay,&mut focus,&mut model,Input{right:true,..Input::default()}));
         assert_eq!(model.host_profile.sensitivity,1.1);
-        let dropdown=clay::id("host-gyro-clutch",0).id;
         for (index,(button,_)) in input::RECEIVER_CLUTCH_KEYS.iter().enumerate(){
             focus.dropdown=dropdown;
             focus.selected=clay::id("dropdown-option",dropdown.wrapping_add(index as u32)).id;
@@ -844,6 +910,19 @@ mod remap_tests {
         frame(&mut app,&mut clay,&mut focus,&mut model,Input{activate:true,..Input::default()});
         assert!(!model.host_profile.receiver_gyro);
         assert_eq!(model.host_profile.button,button);
+        }
+        focus.selected=clay::id("host-native-gyro",0).id;
+        assert!(frame(&mut app,&mut clay,&mut focus,&mut model,Input{activate:true,..Input::default()}));
+        assert!(model.host_profile.native_gyro_clutch);
+        assert!(!model.host_profile.receiver_gyro);
+        assert!(model.host_profile.gyro_mouse.is_none());
+        focus.dropdown=dropdown;
+        focus.selected=clay::id("dropdown-option",dropdown.wrapping_add(1)).id;
+        assert!(frame(&mut app,&mut clay,&mut focus,&mut model,Input{activate:true,..Input::default()}));
+        assert_eq!(model.host_profile.button,"L4");
+        focus.selected=clay::id("host-native-gyro",0).id;
+        assert!(frame(&mut app,&mut clay,&mut focus,&mut model,Input{activate:true,..Input::default()}));
+        assert!(!model.host_profile.native_gyro_clutch);
         model.device.as_mut().unwrap().link=Link::Bluetooth;
         assert!(!frame(&mut app,&mut clay,&mut focus,&mut model,Input::default()));
         for (index,button) in ["R4","L4","PL","PR"].iter().enumerate(){

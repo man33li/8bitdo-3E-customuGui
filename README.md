@@ -3,22 +3,29 @@
 Native replacement for **8BitDo Ultimate Software X** (Windows 1.4.9.0), written in Rust with a
 [Clay](https://github.com/nicbarker/clay) + raylib GUI. It edits the settings stored in an
 **8BitDo Ultimate 3E** controller and adds host-side, Steam-Input-style remapping.
-Controller access and host remapping currently require Linux; Windows 11 supports the GUI,
-demo mode and offline profile tools, with explicit errors for unsupported device operations.
+Linux supports the existing host mapper. Windows 11 x64 has native HID/Bluetooth configuration
+and a ViGEmBus/HidHide right-stick mapper; see the verification limits and driver setup below.
 
 The protocol was recovered from the original Windows binaries (see `reconstruction/`) and every
 device feature listed as *working* below was verified on real hardware.
 
 ## Status
 
+**Firmware 1.38:** receiver configuration replies and heartbeat paddle reports can be
+unavailable even while ordinary input works. The new **Bluetooth-assisted native-stick
+clutch** avoids that channel. It is verified on Linux over both the 2.4 GHz receiver and
+PC-mode USB cable, and was verified on real Windows with ViGEmBus and HidHide. Older table entries
+describe their recorded Linux verification, not a promise that every firmware supports them.
+
 | Feature | 2.4 GHz receiver | Wired USB | Bluetooth |
 |---|---|---|---|
 | Read controller profiles (868-byte image, 3 slots) | ✅ | ✅ verified over GIP (receiver in Xbox mode, `2dc8:202f`); input pauses ~1 s | ✅ |
 | Edit + save profiles (mapping, sticks, triggers, vibration levels, lighting, motion) | ✅ persists across power cycle | ✅ verified (CLI edit persisted across power cycle; GUI save read back). Motion page hidden in Xbox mode, as in Windows | ✅ verified (edit written over Bluetooth, read back over Bluetooth and receiver) |
 | PC (XInput) mode / Tournament flag and Auto Reconnect | ✅ GUI Home → Switch receiver to Xbox mode (confirmation required; persistent; verified). Header flags stay read-only | ✅ GUI Home → Switch receiver to PC (XInput) mode (verified); intended for the Xbox-mode receiver | Flags display only; no mode switch |
-| Live input test page | ✅ including L4/R4/PL/PR (via the Windows heartbeat; verified) | ✅ verified (xone evdev, read without grabbing; buttons, D-pad, sticks, triggers; resumes after Re-read) | ✅ verified, including L4/R4/PL/PR |
+| Live input test page | ✅ including L4/R4/PL/PR (via the Windows heartbeat; verified); Motion shows firmware gyro-as-mouse when Motion target is Mouse | ✅ verified (xone evdev, read without grabbing; buttons, D-pad, sticks, triggers; resumes after Re-read); no motion data | ✅ verified, including L4/R4/PL/PR; Motion shows raw gyro + accelerometer (verified 2026-10-25, firmware 1.38) |
 | Host remapping / turbo / toggle / stick-to-mouse / trigger-to-button | ✅ standard controls verified (A→B, turbo 10.0 Hz, toggle, RT→Space, right stick→mouse); paddles as remap sources implemented, live check pending | ✅ remap verified (physical pad hidden, A→B); other features share the receiver code | ✅ remap, turbo, toggle verified; trigger sides fixed for Bluetooth's trigger layout (unit-tested) |
-| Layers, named profiles, auto profile switching, gyro → mouse | ✅ layers, profile migration and auto switching verified (also hidden); firmware-mouse gyro clutch verified with physical R4 directly (no controller remap) | 🧪; no host gyro clutch | ✅ raw gyro → mouse verified (follows tilt, R4 clutch stops it) |
+| Layers, named profiles, auto profile switching, gyro → mouse | ✅ layers, profile migration and auto switching verified (also hidden); firmware-mouse gyro clutch verified with physical R4 directly (no controller remap) | Xbox-mode GIP has no gyro; PC-mode clutch below | ✅ raw gyro → mouse verified (follows tilt, R4 clutch stops it) |
+| Bluetooth-assisted native-stick R4 clutch | Verified on Linux, firmware 1.38 | Verified on Linux in PC mode (`3024`), not Xbox/GIP | Separate configuration link supplies physical R4 and stick |
 | Vibration motor test | Hidden: receiver xpad node has no FF | ✅ verified (left/right grip motors; trigger motors not reachable via kernel) | Shown only if kernel advertises FF_RUMBLE |
 | Factory reset (all 3 slots to Windows defaults) | ✅ GUI Restore factory profiles → Save + verify; persisted, read-back identical | ✅ verified (device image = `factory-preview`, byte 3 device-managed) | ✅ uses the verified Bluetooth save |
 | Stick / trigger calibration | Switch to Xbox mode, then use the Wired column | ✅ verified (`wired-calibrate sticks\|triggers`; acknowledged, full range afterwards); CLI only, no rollback | Not exposed (Android BLE frames recovered, not tested) |
@@ -28,14 +35,16 @@ device feature listed as *working* below was verified on real hardware.
 **Gyro on 2.4 GHz / wired:** the controller's own motion setting (Motion page, per slot:
 target stick/mouse, hold-to-enable or press-to-toggle, enable button) is stored on the controller
 and works without this app; verified on 2.4 GHz (hold PL → gyro moves the right stick, released →
-none). Neither receiver nor wired provides raw IMU samples. Bluetooth host gyro uses raw motion;
-the optional **2.4 GHz gyro clutch** instead consumes firmware-generated mouse events while the
-host mapper runs (see below). The same clutch works over the USB cable (PC mode `3024`, see "USB
-cable gyro clutch"); Xbox-mode GIP (`202f`) host gyro remains unsupported.
+none). Neither receiver nor wired provides raw IMU samples. Bluetooth host gyro uses raw motion.
+For PC-mode cable/2.4 GHz, **Bluetooth-assisted native-stick clutch** uses the native
+right-stick output and a separate configuration-Bluetooth link for physical R4 and the
+unmixed stick. The older Linux firmware-mouse clutch remains available. Xbox-mode
+GIP (`202f`) has no gyro source.
 
-Back paddles (L4/R4/PL/PR) appear in receiver **physical** reports while the host sends the
-Windows heartbeat (`81 10 04 55` + 28 zero bytes) every 400 ms; captured live independently of
-controller remapping. Test and the host mapper use those reports, not stale `81 14` XInput
+On firmware that supports the receiver heartbeat, back paddles appear in receiver **physical**
+reports while the app sends the Windows heartbeat (`81 10 04 55` + 28 zero bytes) every 400 ms;
+captured live independently of controller remapping.
+Test and the host mapper use those reports, not stale `81 14` XInput
 residue. They share one heartbeat schedule per receiver in the app, paused during profile
 transactions and stopped when neither consumer needs it. Physical reports are sent only when a
 key changes, so a paddle stays held until the next report. D-pad Up/Down/Left also set the PL and
@@ -55,6 +64,10 @@ first receiver physical report, xpad buttons remain the fallback. The firmware d
 slot (`0xff`) means identity standard controls and unmapped paddles. Wired GIP is unchanged:
 firmware remapping is inferred to remain active there.
 
+Native-stick clutch is different: it sends no receiver heartbeat and preserves the
+controller's existing USB slot mappings. The separate Bluetooth link controls only
+the clutch and the physical right stick while held; standard USB controls are not remapped twice.
+
 The mapper snapshots the active slot's map from the GUI's last profile read (not unsaved
 Mapping-page edits); CLI `gyro` reads profiles once on receiver/Bluetooth startup. The profile
 button does not appear in live reports: switching slots while mapping requires stopping,
@@ -64,11 +77,11 @@ The firmware version is shown as a raw record because its meaning on this link i
 
 ## Requirements
 
-- Linux x86-64, or Windows 11 x86-64 (receiver and Bluetooth settings; see build-windows for what
-  is still Linux-only).
+- Linux x86-64, or Windows 11 x86-64. Windows host clutch requires ViGEmBus and HidHide;
+  see the Windows setup and hardware-verification limits below.
 - Nix provides the Linux build environment (`shell.nix`) and Windows cross toolchain (`windows.nix`).
 - Linux builds use Clay at `/home/knd/AI/clay` (`CLAY_DIR` overrides it); Windows builds fetch pinned Clay.
-- Read/write access to the receiver's HID node and (for host remapping) `/dev/uinput`.
+- On Linux, read/write access to the receiver's HID node and (for host remapping) `/dev/uinput`.
   Host mapping also needs read access to its evdev node; vibration testing needs read/write access.
   Check with `ultimate-control devices`. If access is denied, add udev rules. They must load
   **before** `73-seat-late.rules`, otherwise `TAG+="uaccess"` is silently ignored; on NixOS
@@ -119,14 +132,37 @@ Bluetooth GATT backends support profile read/save and live device reports. Check
 under Wine (whose HID layer passes the real receiver through), the Windows receiver code read
 the version and a full 868-byte backup byte-identical to the Linux backend's read of the same
 controller. Wine counts 31 of 32 bytes for output reports (report ID excluded); both counts are
-accepted. Real Windows 11 hardware verification is pending.
+accepted. Real Windows 11 hardware use was verified for the native-stick clutch release.
 
-Not yet available on Windows: wired/Xbox-mode GIP (calibration, PC↔Xbox switch), host mapping
-and gyro clutch (planned: ViGEmBus + HidHide; 2.4 GHz clutch would also need the Interception
-driver, see `reconstruction/specs/spec-windows-backends.md`), rumble, auto profile switching.
+Windows right-stick output is implemented for gaming Bluetooth and Bluetooth-assisted
+PC-mode USB/cable/receiver clutch. It requires **ViGEmBus and HidHide**; neither is bundled
+or installed automatically. Verified on a real Windows PC with the controller and both drivers.
+Firmware-mouse capture, keyboard/mouse destinations, independent extra-paddle output,
+Xbox-mode GIP, rumble and automatic profile switching remain unavailable on Windows.
 The GUI hides the PC→Xbox switch on Windows, because switching back currently requires Linux.
 Bluetooth `scan` shows empty `adapter_address`/`adapter_address_type` (WinRT doesn't report the
 adapter). No driver replacement or administrator token is needed for HID.
+
+Install drivers only from their official projects:
+
+- [ViGEmBus final setup](https://github.com/nefarius/ViGEmBus/releases/tag/v1.22.0).
+  The project is retired; the final setup removes its obsolete updater. Do not disable
+  Windows security features to make an old driver load.
+- [HidHide](https://github.com/nefarius/HidHide/releases). Close its configuration client
+  before starting the mapper. The app temporarily whitelists its executable and hides
+  only the selected gamepad HID/XUSB nodes, preserving existing settings. It refuses
+  ambiguous device identities, inverse cloaking, or activation of unrelated inactive entries.
+
+Stop and error cleanup remove only this session's additions. A durable, per-user journal
+(`%APPDATA%\ultimate-control\hidhide-journal.json`) allows the next GUI/mapper startup to
+recover an interrupted session, even if the executable was moved. If settings have changed
+outside the recorded transitions, recovery refuses to overwrite them; use HidHide to unhide
+the intended controller manually. HidHide's control handle is held during mapping, so its
+configuration client cannot edit settings until mapping stops.
+
+[HidHide cannot block all Raw Input readers](https://docs.nefarius.at/projects/HidHide/FAQ/).
+Verify that the target game sees only the virtual Xbox controller; already-open handles,
+Raw Input and anti-cheat behavior are not universal compatibility guarantees.
 
 First receiver checks on real Windows 11, from PowerShell with the original Ultimate Software
 closed, the receiver plugged in and the controller awake in 2.4 GHz mode:
@@ -174,9 +210,10 @@ wine target/x86_64-pc-windows-gnu/release/ultimate-control.exe gui --demo --scre
    target/release/ultimate-control gui
    ```
 
-3. The app finds the receiver and reads all three profile slots. **Home** shows the device, active
-   slot, polling-rate/profile flags and auto-reconnect. Header flags are read-only: full-profile saves
-   preserve them. Home also offers a confirmed, persistent receiver PC / Xbox mode switch (see below).
+3. The app detects gamepad input separately from controller settings. Older firmware can load
+   settings directly over the receiver; on a PC-mode cable or firmware 1.38 use **Home →
+   Connect Bluetooth** as described below. Home shows the settings link and active slot once
+   loaded. Header flags stay read-only and full-profile saves preserve them.
 4. Change settings on **Mapping, Sticks, Triggers, Vibration, Lighting, Motion** and **Profiles**.
    Edits are *staged* only; nothing reaches the controller yet.
 5. Click **Save + verify**. The app writes all three slots, commits them, then reads the controller
@@ -185,14 +222,18 @@ wine target/x86_64-pc-windows-gnu/release/ultimate-control.exe gui --demo --scre
 6. **Revert / re-read** discards staged edits and reloads from the controller.
 7. **Test** shows live buttons, sticks and triggers.
 
-For Bluetooth configuration, unplug the receiver, stop the host mapper and close the mobile app.
-Switch to Bluetooth gaming mode; hold the front pixel-logo/profile button for **3 seconds** until
-configuration LEDs blink, then select **Home → Connect Bluetooth**. Scanning starts only on that
-request (20-second window). The separate `81HF01` configuration radio supplies all three profiles
-to the same editor pages; **Revert / re-read** reloads them. **Save is hidden on Bluetooth** until
-the recovered write/commit protocol passes a parent-controlled hardware identity-write probe.
-Edits remain local. Bluetooth host mapping owns the same configuration bearer, so starting the
-mapper closes the editor's Bluetooth connection; stop mapping and connect again to reload.
+For Bluetooth configuration, **keep the receiver/cable connected and do not change gameplay
+mode**. Stop the host mapper and close competing configuration apps. Hold the front
+pixel-logo/profile button for **3 seconds** until configuration LEDs blink, then select
+**Home → Connect Bluetooth**. Discovery has a 20-second window. The separate `81HF01`
+configuration radio supplies all three profiles to the editor; **Revert / re-read** reloads
+them and **Save + verify** writes and checks them.
+
+Starting the GUI mapper reuses this connection on its owning worker instead of disconnecting
+and scanning again. Stopping the mapper keeps settings connected, so starting it again does
+not require another profile-button gesture. Reading/saving settings is blocked while the
+mapper consumes the same Bluetooth stream. A real disconnect or closing the app still
+requires enabling configuration Bluetooth again.
 
 The BLE CRC investigation and exact parent verification steps are in
 [`spec-ble-write.md`](reconstruction/specs/spec-ble-write.md).
@@ -300,9 +341,11 @@ and a tuning recipe. The page list scrolls when the window is short.
 Navigation: mouse, or Tab/arrow keys and the controller D-pad; Enter/A activates; Left/Right adjust
 sliders; Escape/B closes dialogs.
 
-If the app says the controller is **asleep or out of range**, press a button on the controller and
-click **Refresh**. The controller switches slots with a short press of the front profile button;
-the active slot is shown on Home after the next read.
+**Gamepad detected — controller settings not connected** means USB input was found but no
+settings image has been loaded. A USB configuration timeout is not proof that the controller
+is asleep: cable/firmware 1.38 can supply input while ignoring those commands. Use
+**Connect Bluetooth** without unplugging or changing gameplay mode. A short press of the
+front profile button changes slots; stop mapping and re-read settings after changing slots.
 
 Useful flags: `--demo` (fake device, no I/O), `--page NAME`, `--debug-pointer` (crosshair to check
 mouse alignment on scaled displays), `--bench` (frame timings), `--screenshot /abs/path.png`.
@@ -354,9 +397,65 @@ were not recovered from the available IR/metadata: overlays are displayed in lab
 with normal/pressed state, rather than claiming a pixel-identical Windows composite.
 Illustrations retain their aspect ratios in the native layout.
 
-### 2.4 GHz gyro clutch
+### Bluetooth-assisted native-stick clutch (Linux and Windows)
 
-On **Remap**, enable **2.4 GHz gyro clutch**, select **R4**, **L4**, **PL**, **PR** or a
+This mode uses firmware gyro-to-right-stick output over **PC-mode USB (`2dc8:3024`)**,
+through either the receiver or cable. A separate configuration-Bluetooth connection
+provides the physical paddle and unmixed right stick. A Bluetooth adapter is required
+even when gameplay uses USB. No receiver heartbeat or runtime profile write is sent.
+
+1. Back up the controller. In its active slot, set Motion target to **Right stick** and
+   **press-toggle on a different button**, for example PL. Map the clutch paddle, usually
+   R4, to **None**. Keep right-stick inversion and stick swap off.
+2. Save and verify the controller slot, restart the controller, and select that slot.
+3. On **Remap**, enable **USB / 2.4 GHz native-stick clutch (Bluetooth-assisted)**,
+   choose R4, and save a host profile.
+4. If Bluetooth settings are not already connected, hold the front profile button for about
+   three seconds until the LEDs blink. Start **Host input mapper** on Home. An existing GUI
+   settings connection is reused; close competing configuration apps.
+5. Press the separate firmware toggle button once if gyro is off. Its toggle state is
+   not observable, so startup validates the stored setup but does not pretend to enable it.
+
+While R4 is released, the app forwards the native USB stick/gyro output. While held, it
+forwards only the physical right stick, so R3 and thumbstick control remain usable.
+The held-state stick has the Bluetooth report's **8-bit resolution** and lower update rate
+(about 31 ms in the earlier capture); firmware stick curves are not reconstructed there.
+Tune gyro sensitivity/compensation in the controller's Motion page: host raw-gyro
+smoothing, acceleration and mouse settings do not apply to this source.
+
+Minimal host profile:
+
+```json
+{"native_gyro_clutch": true, "button": "R4"}
+```
+
+Or start from the command line:
+
+```bash
+ultimate-control gyro --native-gyro-clutch --button R4
+```
+
+The setting is mutually exclusive with `receiver_gyro`, `gyro_mouse`, Steam output and
+right-stick-to-mouse. A source disconnect stops mapping and releases the virtual output.
+Stop before changing controller slots or reading/saving controller profiles.
+
+**Verification:** real Linux receiver and USB-cable captures showed gyro when released,
+sustained suppression while R4 was held, full physical right-stick travel and R3 while
+clutched, preserved PL→L3 slot mapping, and no events reaching a separate reader of the
+grabbed physical gamepad. Cable shutdown exited cleanly, removed the virtual pad and
+released the physical input device. Both release builds succeeded; 197 Linux tests and
+174 Windows tests passed (the latter under Wine).
+The real GUI also loaded settings and started the mapper with both receiver and cable
+gameplay connected. Receiver stop/restart retained the same Bluetooth connection without
+another profile-button gesture; the GUI-started cable capture verified R4 suppression and
+physical right-stick/R3 operation.
+
+Windows HID/ViGEm/HidHide behavior was verified on a real Windows PC with the controller
+and both drivers installed.
+
+### Legacy firmware-mouse gyro clutch (Linux)
+
+On **Remap**, enable **Firmware-mouse gyro clutch (Linux)**, select **R4**, **L4**, **PL**, **PR** or a
 receiver-visible Xbox button, and choose **Right stick** or **Mouse**, then save the host
 profile and start the mapper on Home. Opt-in defaults to `false`; selecting the receiver
 link alone never rewrites a stored Bluetooth clutch. Unsupported selections reset to `R4`
@@ -393,10 +492,12 @@ continuous between ordinary ~4 ms reports, then decays smoothly to the physical 
 two measured report periods without motion; there is no hard 30 ms reset. This is firmware
 mouse output, not raw IMU, and firmware filtering cannot be undone.
 
-### USB cable gyro clutch
+### Legacy USB-cable firmware-mouse clutch (Linux)
+
+For an independent R4 clutch without sharing R3, use Bluetooth-assisted native-stick mode above.
 
 With the USB cable the controller enumerates as the same `2dc8:3024` device as the receiver
-(gamepad, firmware gyro mouse, vendor interface), so the same **2.4 GHz gyro clutch** setting is
+(gamepad, firmware gyro mouse, vendor interface), so the same **Firmware-mouse gyro clutch (Linux)** setting is
 used. Differences, verified live 2026-10-20: the controller never answers configuration requests
 over the cable (no profile read/save, version or Test-page paddles; use the receiver or
 Bluetooth for those), and paddles are invisible unless the controller slot maps them to a
@@ -419,7 +520,7 @@ paddle clutch (`R4`/`L4`/`PL`/`PR`) is refused over the cable with instructions.
 | `inspect FILE.bin` | Decode a backup offline | no |
 | `devices` | List detected controllers and access rights | no |
 | `scan`, `backup FILE.bin` | Bluetooth configuration radio (`81HF01`) discovery and read-only backup | no |
-| `gyro …` | Bluetooth host gyro clutch (see `--help`) | no |
+| `gyro …` | Host gyro clutch; add `--native-gyro-clutch` for PC-mode USB plus configuration BLE | no |
 | `profile`, `replay` | Create / test host-mapping profiles offline | no |
 | `ble-write FILE.bin [--address ADDR]` | Bluetooth write, commit, verify read-back | **yes, persistent** |
 | `wired-info` | List `2dc8:202f` (Xbox-mode) USB devices, drivers and access; opens nothing | no |
@@ -524,7 +625,7 @@ required to recalibrate. Driver handback still runs; no safe halfway rollback is
 | Symptom | Fix |
 |---|---|
 | `receiver (2dc8:3024) vendor interface not found` | Receiver/dock unplugged, or a wired controller in Xbox mode (2dc8:202f) is connected instead. |
-| `Controller did not acknowledge report disable` | Controller asleep/off or paired to another receiver: wake it and retry. **Also happens when the controller is cabled directly:** it briefly appears as an Xbox pad (202f), is reset by the `xone` driver and falls back to a PC mode (3024) where input works but settings commands are ignored. Use the charging dock / 2.4 GHz receiver for configuration. |
+| `Controller did not acknowledge report disable` / USB configuration did not reply | Input can still work when USB settings commands are unavailable, including PC-mode cable and firmware 1.38. Keep the cable/receiver connected and gameplay mode unchanged; hold the profile button for 3 seconds, then use **Home → Connect Bluetooth**. If no gamepad input is detected either, check controller power, pairing and access. |
 | Permission denied on `/dev/hidraw*` or `/dev/uinput` | Add the udev rule above, re-plug. |
 | Permission denied during vibration test | Grant read/write access to the controller's `/dev/input/eventN`; FF capability discovery does not imply access. |
 | Mouse clicks land on the wrong control | Run `gui --debug-pointer` and report the overlay values. |

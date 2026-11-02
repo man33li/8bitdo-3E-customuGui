@@ -32,7 +32,7 @@ unsafe extern "system" fn console_interrupt(control: u32) -> windows::core::BOOL
 }
 fn help() {
     println!(
-        "Ultimate Control — native Rust controller tools\n\n  ultimate-control ui [--port PORT] [--profile HOST.json]\n  ultimate-control devices\n  ultimate-control scan [--timeout SECONDS]\n  ultimate-control inspect PROFILES.bin\n  ultimate-control backup PROFILES.bin [--address ADDRESS] [--timeout SECONDS]\n  ultimate-control gyro [--device /dev/input/eventN] [--address ADDRESS]\n      [--profile HOST.json] [--button R4|L4|PL|PR] [--sensitivity NUMBER]\n      [--deadzone NUMBER] [--invert-x] [--invert-y] [--map SOURCE=DESTINATION]\n  ultimate-control profile HOST.json [host options above] [--replace]\n  ultimate-control replay INPUT.jsonl [--profile HOST.json]\n  ultimate-control reassemble CAPTURE.jsonl [--output PROFILES.bin]\n  ultimate-control motion-packet --slot 1|2|3 --record HEX [--crc]\n  ultimate-control windows-motion --feature HEX_BYTE\n  ultimate-control windows-commit\n\nUI and gyro customize host input only; no profile writes or firmware flashing.\nBackup temporarily disables reporting and restores it before returning.\nGaming Bluetooth + configuration advertisement81HF01 required for gyro.\nFull Windows application equivalence is NOT established; see reconstruction/manifest.json."
+        "Ultimate Control — native Rust controller tools\n\n  ultimate-control ui [--port PORT] [--profile HOST.json]\n  ultimate-control devices\n  ultimate-control scan [--timeout SECONDS]\n  ultimate-control inspect PROFILES.bin\n  ultimate-control backup PROFILES.bin [--address ADDRESS] [--timeout SECONDS]\n  ultimate-control gyro [--device PATH] [--address ADDRESS]\n      [--profile HOST.json] [--button R4|L4|PL|PR] [--native-gyro-clutch]\n      [--sensitivity NUMBER] [--deadzone NUMBER] [--invert-x] [--invert-y]\n      [--map SOURCE=DESTINATION]\n  ultimate-control profile HOST.json [host options above] [--replace]\n  ultimate-control replay INPUT.jsonl [--profile HOST.json]\n  ultimate-control reassemble CAPTURE.jsonl [--output PROFILES.bin]\n  ultimate-control motion-packet --slot 1|2|3 --record HEX [--crc]\n  ultimate-control windows-motion --feature HEX_BYTE\n  ultimate-control windows-commit\n\nUI and gyro customize host input only; no profile writes or firmware flashing.\nBackup temporarily disables reporting and restores it before returning.\nRaw gyro uses gaming Bluetooth plus configuration BLE (81HF01).\n--native-gyro-clutch uses PC-mode USB/cable or 2.4 GHz plus configuration BLE.\nNative mode requires controller Motion: Right stick, press-toggle on a non-clutch button; the clutch paddle must be unmapped.\nWindows right-stick output requires ViGEmBus and HidHide; drivers are never installed automatically."
     );
     println!("  ultimate-control gui [--demo] [--bench] [--debug-pointer] [--page NAME] [--screenshot PATH.png] [--assets DIR]");
     println!("  ultimate-control wired-info\n  ultimate-control wired-version --takeover\n  ultimate-control wired-backup PROFILES.bin --takeover\n  ultimate-control wired-write PROFILES.bin --takeover\n  ultimate-control wired-xinput-mode --takeover --confirm   (receiver stuck as 2dc8:202f -> back to PC mode 3024)");
@@ -108,6 +108,9 @@ fn profile(args: &mut Vec<String>) -> Result<HostProfile> {
     }
     if flag(args, "--invert-y")? {
         profile.invert_y = true;
+    }
+    if flag(args, "--native-gyro-clutch")? {
+        profile.native_gyro_clutch = true;
     }
     let mut mapped = std::collections::BTreeSet::new();
     while let Some(at) = args.iter().position(|a| a == "--map") {
@@ -306,8 +309,7 @@ fn dispatch() -> Result<()> {
         args.remove(0)
     };
     #[cfg(target_os = "windows")]
-    if command == "gyro" || command.starts_with("wired-")
-    {
+    if command.starts_with("wired-") {
         return Err(invalid(format!("{command} is not yet supported on Windows")));
     }
     #[cfg(windows)]
@@ -322,10 +324,7 @@ fn dispatch() -> Result<()> {
         }
         "devices" => {
             arity(&args, 0)?;
-            #[cfg(target_os = "linux")]
             json(&input::devices()?)?;
-            #[cfg(windows)]
-            json(&ultimate_control::receiver::devices()?)?;
         }
         "scan" => {
             let timeout = seconds(&mut args)?;

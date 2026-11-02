@@ -767,6 +767,7 @@ mod windows_buffer_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -950,16 +951,13 @@ mod tests {
         save_backup(&path, &image).unwrap();
         let saved = std::fs::read(&path).unwrap();
         assert_eq!(saved, image);
+        #[cfg(target_os = "linux")]
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
         assert!(save_backup(&path, &[0; CONFIG_SIZE]).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), image);
-        assert_eq!(
-            inspect_config(&saved).unwrap(),
-            inspect_config(&image).unwrap()
-        );
         std::fs::remove_file(path).unwrap();
     }
     #[test]

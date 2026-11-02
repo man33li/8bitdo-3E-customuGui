@@ -4,7 +4,6 @@ use crate::{Result, interrupted, invalid, protocol};
 use std::{
     io,
     marker::PhantomData,
-    path::Path,
     sync::{Arc, atomic::{AtomicBool, AtomicU16, Ordering}, mpsc::{self, Receiver, RecvTimeoutError}},
     thread,
     time::{Duration, Instant},
@@ -341,6 +340,3 @@ impl Connection {
     pub fn close(&mut self) -> Result<()> { self.client.close() }
 }
 
-pub fn run_controller(_device: Option<&Path>, _profile: &crate::input::HostProfile, _slot_map: Option<crate::profile::KeyMap>, _address: Option<&str>, _timeout: Duration, _stopped: Arc<AtomicBool>) -> Result<()> {
-    Err(invalid("Bluetooth host mapper not yet supported on Windows; Bluetooth profile configuration and physical notifications are available"))
-}

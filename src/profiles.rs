@@ -172,6 +172,7 @@ mod tests {
         assert_eq!(select(&[rule("not-substring","aunch")],&processes),None);
         assert_eq!(select(&[rule("empty","")],&processes),None);
     }
+    #[cfg(target_os = "linux")]
     #[test]
     fn fake_proc_filters_uid_and_skips_unreadable_entries(){
         let temp=Temp::new();

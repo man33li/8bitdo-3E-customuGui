@@ -23,6 +23,8 @@ pub struct Model {
     /// Physical BLE/receiver paddle masks; not derived from XInput reports.
     pub paddles:u32,
     pub test_visible:bool,
+    /// Test page only: live IMU (Bluetooth) or firmware gyro-mouse rate (receiver/cable).
+    pub motion:Option<crate::gui::test_input::Motion>, pub motion_from_mouse:bool,
     pub operation:Option<Operation>, pub notice:Option<String>,
     pub host_profile:HostProfile, pub mapper_running:bool, pub mapper_pending:bool,
     pub host_profile_name:String, pub host_profile_names:Vec<String>,
@@ -39,7 +41,8 @@ impl Model {
         self.demo||self.device.as_ref().is_some_and(|d|d.link!=Link::Bluetooth||BLE_WRITE_VERIFIED)
     }
     pub fn can_connect_bluetooth(&self)->bool{
-        !self.demo&&self.device.is_none()&&!self.mapper_running&&!self.mapper_pending&&self.operation.is_none()
+        !self.demo&&!self.device.as_ref().is_some_and(|device|device.link==Link::Bluetooth)
+            &&!self.mapper_running&&!self.mapper_pending&&self.operation.is_none()
     }
     pub fn receiver_mode_link(&self)->Option<Link>{
         if self.demo{return None;}
@@ -51,14 +54,16 @@ impl Model {
         })
     }
     pub fn mapper_device(&self)->Result<&DeviceInfo>{
-        let link=self.device.as_ref().map(|d|match d.link{Link::Receiver=>LinkKind::Receiver,Link::Wired=>LinkKind::Wired,Link::Bluetooth=>LinkKind::Bluetooth});
+        let link=if self.host_profile.native_gyro_clutch{Some(LinkKind::Receiver)}else{
+            self.device.as_ref().and_then(|d|match d.link{Link::Receiver=>Some(LinkKind::Receiver),Link::Wired=>Some(LinkKind::Wired),Link::Bluetooth=>None})
+        };
         let mut candidates=self.input_devices.iter().filter(|d|link.is_none_or(|link|d.link==link));
         let selected=candidates.next().ok_or_else(||invalid("No supported receiver, Bluetooth or wired input node detected"))?;
         if candidates.next().is_some(){return Err(invalid("Multiple controllers on this link; disconnect all but the intended controller"));}
         Ok(selected)
     }
     pub fn host_notice(&self)->Result<Option<&'static str>>{
-        self.host_profile.validate_for_link(self.mapper_device()?.link)
+        self.host_profile.validate_runtime(self.mapper_device()?.link)
     }
     pub fn rumble_levels(&self)->[u8;2]{
         self.profiles.as_ref().map(|p|{
@@ -73,6 +78,7 @@ impl Model {
     }
     /// Only the last read/save baseline describes controller state; edits are staged.
     pub fn mapper_key_map(&self)->Option<KeyMap>{
+        if self.host_profile.native_gyro_clutch{return None;}
         self.baseline.as_ref()?.selected_slot().map(|slot|slot.key_map.clone())
     }
     pub fn load(&mut self,profiles:Profiles) {
@@ -254,6 +260,26 @@ mod tests {
         DeviceInfo{path:PathBuf::from("/not-a-device"),name:"test controller".into(),bus:match link{LinkKind::Bluetooth=>5,LinkKind::Wired=>6,LinkKind::Receiver=>3},vendor:0x2dc8,product:if link==LinkKind::Receiver{0x3024}else{0x202f},physical:"test/input0".into(),hidraw:None,identity:"test".into(),input_access:true,hidraw_access:false,link}
     }
     #[test]
+    fn native_clutch_uses_usb_input_while_configuration_uses_bluetooth(){
+        let mut m=Model{
+            device:Some(Device{name:"configuration".into(),link:Link::Bluetooth,pid:0x202f,version_record:None}),
+            input_devices:vec![input_device(LinkKind::Bluetooth),input_device(LinkKind::Receiver)],
+            host_profile:HostProfile{native_gyro_clutch:true,..HostProfile::default()},
+            ..Model::default()
+        };
+        assert_eq!(m.mapper_device().unwrap().link,LinkKind::Receiver);
+        m.input_devices.push(input_device(LinkKind::Receiver));
+        assert!(m.mapper_device().is_err());
+        m.input_devices.retain(|device|device.link==LinkKind::Bluetooth);
+        assert!(m.mapper_device().is_err());
+        m.host_profile.native_gyro_clutch=false;
+        assert_eq!(m.mapper_device().unwrap().link,LinkKind::Bluetooth);
+        m.input_devices=vec![input_device(LinkKind::Receiver)];
+        assert_eq!(m.mapper_device().unwrap().link,LinkKind::Receiver);
+        m.input_devices.push(input_device(LinkKind::Bluetooth));
+        assert!(m.mapper_device().is_err(),"configuration BLE must not select a gameplay transport");
+    }
+    #[test]
     fn named_profiles_demo_edits_selected_profile_without_device_or_file_io(){
         let mut state=DemoState::new();
         state.dispatch(Action::NewHostProfile("Shooter".into())).unwrap();
@@ -283,7 +309,8 @@ mod tests {
         host.trigger_buttons.left=Some(crate::input::TriggerButton{destination:"BTN_LEFT".into(),threshold:0.4});
         m.edit(Action::SetHostProfile(Box::new(host))).unwrap();
         assert!(!m.dirty());assert!(m.profiles.is_none());
-        assert_eq!(m.host_notice().unwrap(),Some(crate::input::RECEIVER_NOTICE));
+        if cfg!(windows){assert!(m.host_notice().is_err());}
+        else{assert_eq!(m.host_notice().unwrap(),Some(crate::input::RECEIVER_NOTICE));}
         m.input_devices[0].link=LinkKind::Bluetooth;
         assert!(m.host_notice().unwrap_err().to_string().contains("clutch"));
         m.mapper_running=true;

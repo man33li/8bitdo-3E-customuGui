@@ -4,12 +4,11 @@
 //! 0xfc + slot * 0x120; inverse hold is host policy, not a firmware feature.
 //! Raw gyro layout follows that implementation/SDL: report 1, 32 bytes,
 //! little-endian i16 XYZ at bytes 21/23/25. This is not Windows-bundle parity.
-//! Receiver gyro uses the firmware mouse interface; wired GIP has no host gyro.
-//! Physical receiver paddles use the vendor HID stream, enabled by Windows heartbeat.
+//! Receiver gyro can use firmware mouse or firmware right stick with configuration BLE.
+//! Wired GIP has no gyro. Firmware-mouse paddles use the vendor heartbeat.
 //! Gyro processing follows GyroWiki/JoyShockMapper: soft tiered smoothing,
 //! tightening, velocity-based sensitivity, then mouse or deadzone-compensated stick.
-//! Mapping and profile logic are shared; device access is Linux-only.
-//! Windows device entry points return explicit unsupported errors.
+//! Mapping and profile logic are shared across Linux and Windows.
 
 use crate::{Result, invalid, protocol::PhysicalInput};
 use serde::{Deserialize, Serialize, Serializer};
@@ -37,7 +36,7 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-pub use windows::{devices, rumble, run, run_receiver, run_wired};
+pub use windows::{devices, recover_owned_output, rumble, run, run_native_clutch, run_receiver, run_wired};
 
 pub const AXES: [u16; 8] = [0, 1, 2, 5, 9, 10, 16, 17];
 pub const KEY_CODES: [u16; 24] = [
@@ -62,6 +61,7 @@ pub const RECEIVER_NOTICE: &str = "Receiver: physical L4/R4/PL/PR sources use th
 pub const WIRED_NOTICE: &str = "WIRED: clutch settings are ignored; no host gyro/IMU. Physical paddles are unavailable unless the controller profile maps them to standard buttons.";
 pub const RECEIVER_GYRO_NOTICE: &str = "2.4 GHz gyro clutch: set controller Motion target to Mouse; enable via press-toggle (turn on once) or hold. Physical R4/L4/PL/PR work directly as clutch buttons; no controller remap needed. With the mapper closed, firmware gyro moves the desktop cursor.";
 pub const CABLE_GYRO_NOTICE: &str = "USB-cable gyro clutch: set controller Motion target to Mouse; enable via press-toggle (turn on once) or hold. The clutch must be a standard button (paddles only via the slot mapping). With the mapper closed, firmware gyro moves the desktop cursor.";
+pub const NATIVE_GYRO_NOTICE: &str = "Bluetooth-assisted native-stick clutch: enable configuration Bluetooth before Start. Use controller Right-stick motion, press-toggle on a separate button, and an unmapped clutch paddle. Turn firmware gyro on once. Hold the clutch to use only the physical right stick.";
 /// Receiver standard buttons plus vendor physical paddle sources.
 pub const RECEIVER_CLUTCH_KEYS: &[(&str, u16)] = &[
     ("BTN_SOUTH", 304), ("BTN_EAST", 305), ("BTN_NORTH", 307), ("BTN_WEST", 308),
@@ -518,6 +518,8 @@ pub struct HostProfile {
     pub gyro_mouse: Option<GyroMouse>,
     /// Opt in to grabbing the receiver's firmware gyro mouse interface.
     pub receiver_gyro: bool,
+    /// Use firmware right-stick gyro with a configuration-BLE physical clutch.
+    pub native_gyro_clutch: bool,
     /// Shared mouse/stick filters. Legacy sensitivity is an additional output gain;
     /// legacy deadzone becomes a soft tightening threshold, never a hard cutoff.
     pub gyro: GyroSettings,
@@ -543,6 +545,7 @@ impl Default for HostProfile {
             layers: Vec::new(),
             gyro_mouse: None,
             receiver_gyro: false,
+            native_gyro_clutch: false,
             gyro: GyroSettings::default(),
             steam: false,
         }
@@ -583,8 +586,30 @@ fn validate_cable_clutch(profile: &HostProfile) -> Result<()> {
 }
 
 impl HostProfile {
+    pub fn validate_runtime(&self, link: LinkKind) -> Result<Option<&'static str>> {
+        let notice = self.validate_for_link(link)?;
+        #[cfg(target_os = "windows")]
+        windows::validate_profile(self, link)?;
+        Ok(notice)
+    }
+
     /// Evdev transports without receiver gyro ignore Bluetooth clutch settings.
     pub fn validate_for_link(&self, link: LinkKind) -> Result<Option<&'static str>> {
+        if self.native_gyro_clutch {
+            if link != LinkKind::Receiver {
+                return Err(invalid("native gyro clutch requires a PC-mode USB controller"));
+            }
+            if self.receiver_gyro || self.gyro_mouse.is_some() || self.steam {
+                return Err(invalid("native gyro clutch cannot be combined with receiver gyro, gyro mouse or Steam output"));
+            }
+            if self.stick_mouse.is_some_and(|m| m.stick == Stick::Right)
+                || self.layers.iter().any(|l| l.stick_mouse.is_some_and(|m| m.stick == Stick::Right)) {
+                return Err(invalid("native gyro clutch cannot use the right stick as a mouse"));
+            }
+            self.validate_gyro_settings()?;
+            self.validate_inner(Some(clutch_button(&self.button)?.0))?;
+            return Ok(Some(NATIVE_GYRO_NOTICE));
+        }
         match link {
             LinkKind::Bluetooth => {
                 self.validate()?;
@@ -606,6 +631,12 @@ impl HostProfile {
     /// Clutch visibility and binding conflicts are checked by the selected runtime.
     pub fn validate_structure(&self) -> Result<()> {
         self.validate_gyro_settings()?;
+        if self.native_gyro_clutch {
+            if self.receiver_gyro || self.gyro_mouse.is_some() || self.steam {
+                return Err(invalid("native gyro clutch conflicts with another gyro source or Steam output"));
+            }
+            clutch_button(&self.button)?;
+        }
         // Retain the selected receiver button when switching its opt-in back off.
         if self.receiver_gyro || clutch_button(&self.button).is_err() {
             receiver_clutch_button(&self.button)?;
@@ -990,6 +1021,7 @@ pub struct Mapper {
     gyro_fraction: [f64; 2],
     last_tick: Duration,
     receiver_gyro: bool,
+    native_gyro_clutch: bool,
     receiver_pending: [i32; 2],
     receiver_last_sample: Option<Duration>,
     receiver_motion_at: Option<Duration>,
@@ -1027,7 +1059,9 @@ impl Mapper {
     fn new_with_receiver_gyro(profile: &HostProfile, axes: [AxisInfo; 8], link: LinkKind, receiver_gyro: bool) -> Result<Self> {
         profile.validate_for_link(link)?;
         validate_source_axes(&axes, link)?;
-        let (mut consumed_mask, physical_mask) = if link == LinkKind::Bluetooth {
+        let (mut consumed_mask, physical_mask) = if profile.native_gyro_clutch {
+            (0, clutch_button(&profile.button)?.1)
+        } else if link == LinkKind::Bluetooth {
             let (button, physical_mask) = clutch_button(&profile.button)?;
             (1 << KEY_CODES.iter().position(|&key| key == button).unwrap(), physical_mask)
         } else if receiver_gyro {
@@ -1095,6 +1129,7 @@ impl Mapper {
             gyro_fraction: [0.0; 2],
             last_tick: Duration::ZERO,
             receiver_gyro,
+            native_gyro_clutch: profile.native_gyro_clutch,
             receiver_pending: [0; 2],
             receiver_last_sample: None,
             receiver_motion_at: None,
@@ -1245,6 +1280,29 @@ impl Mapper {
 
     pub fn physical_input(&mut self, state: PhysicalInput) -> Frame {
         self.physical_input_at(state, self.origin.elapsed())
+    }
+
+    /// Configuration BLE carries the unmixed physical stick and clutch only.
+    pub fn native_physical_at(&mut self, state: PhysicalInput, now: Duration) -> Result<Frame> {
+        if self.closed || !self.native_gyro_clutch {
+            return Err(invalid("native physical report supplied to the wrong mapper"));
+        }
+        let mut frame = self.tick_frame(now);
+        self.held = state.buttons & self.physical_mask != 0;
+        let convert = |value: u8| {
+            let value = i32::from(value) - 128;
+            if value < 0 { value * 32768 / 128 } else { value * 32767 / 127 }
+        };
+        self.physical_right = [convert(state.right_x), convert(state.right_y)];
+        self.native_right(&mut frame);
+        frame.sync();
+        Ok(frame)
+    }
+
+    fn native_right(&mut self, frame: &mut Frame) {
+        let values = if self.held { self.physical_right } else { [self.analog[2], self.analog[3]] };
+        self.axis(frame, 2, values[0]);
+        self.axis(frame, 3, values[1]);
     }
 
     /// Clock-injected physical/clutch update; integrates motion up to this edge.
@@ -1563,11 +1621,12 @@ impl Mapper {
                 }
                 self.buttons(&mut frame, now.max(self.last_tick));
                 for index in 0..8 {
-                    if !self.receiver_gyro || !(2..4).contains(&index) {
+                    if !(self.receiver_gyro || self.native_gyro_clutch) || !(2..4).contains(&index) {
                         self.axis(&mut frame, index, self.analog[index]);
                     }
                 }
                 if self.receiver_gyro { self.right(&mut frame); }
+                if self.native_gyro_clutch { self.native_right(&mut frame); }
                 frame.sync();
                 return Ok(frame);
             }
@@ -1837,7 +1896,7 @@ fn bitmap_has(bitmap: &str, bit: u16) -> Result<bool> {
 
 #[cfg(target_os = "linux")]
 /// Opt-in selection is sysfs-only. Disabled profiles do not even inspect the mouse.
-fn receiver_mouse_path(profile: &HostProfile, device: &DeviceInfo, input_class: &Path) -> Result<Option<PathBuf>> {
+pub(crate) fn receiver_mouse_path(profile: &HostProfile, device: &DeviceInfo, input_class: &Path) -> Result<Option<PathBuf>> {
     if device.link != LinkKind::Receiver || !profile.receiver_gyro { return Ok(None); }
     let event = device.path.file_name().ok_or_else(|| invalid("invalid input event path"))?;
     let resolved = fs::canonicalize(input_class.join(event).join("device"))?;
@@ -2888,7 +2947,7 @@ pub fn run(
     physical: Receiver<PhysicalInput>,
     stopped: Arc<AtomicBool>,
 ) -> Result<()> {
-    profile.validate()?;
+    profile.validate_for_link(LinkKind::Bluetooth)?;
     let selected = device.map(fs::canonicalize).transpose()?;
     let mut candidates = devices()?
         .into_iter()
@@ -2956,6 +3015,55 @@ pub fn run(
 }
 
 #[cfg(target_os = "linux")]
+pub fn run_native_clutch(
+    device: Option<&Path>, profile: &HostProfile, physical: Receiver<PhysicalInput>,
+    stopped: Arc<AtomicBool>,
+) -> Result<()> {
+    profile.validate_for_link(LinkKind::Receiver)?;
+    if !profile.native_gyro_clutch { return Err(invalid("native gyro clutch is not enabled")); }
+    let selected = device.map(fs::canonicalize).transpose()?;
+    let mut candidates = devices()?.into_iter().filter(|candidate| candidate.link == LinkKind::Receiver
+        && selected.as_ref().is_none_or(|path| path == &candidate.path));
+    let device = candidates.next().ok_or_else(|| invalid("no matching PC-mode USB controller"))?;
+    if candidates.next().is_some() { return Err(invalid("multiple controllers; select an event device")); }
+    let first = loop {
+        if stopped.load(Ordering::Acquire) || crate::interrupted() { return Ok(()); }
+        match physical.recv_timeout(Duration::from_millis(20)) {
+            Ok(state) => break state,
+            Err(RecvTimeoutError::Timeout) => (),
+            Err(RecvTimeoutError::Disconnected) => return Err(invalid("configuration BLE disconnected before first physical state")),
+        }
+    };
+    let (source, id, axes, properties) = Source::open(&device)?;
+    let mut mapper = Mapper::new_receiver(profile, axes)?;
+    mapper.native_physical_at(first, Duration::ZERO)?;
+    mapper.values = [None; 8];
+    let output = Outputs::create(&device, id, &axes, &properties, &mapper, false)?;
+    let mut session = Session { mapper, output, source, receiver_mouse: None };
+    drain_native(&mut session, &physical)?;
+    if stopped.load(Ordering::Acquire) || crate::interrupted() { return session.close(); }
+    session.source.grab()?;
+    let result = receiver_loop(&mut session, None, Some(&physical), &stopped);
+    let cleanup = session.close();
+    result?;
+    cleanup
+}
+
+#[cfg(target_os = "linux")]
+fn drain_native(session: &mut Session, physical: &Receiver<PhysicalInput>) -> Result<()> {
+    loop {
+        match physical.try_recv() {
+            Ok(state) => {
+                let frame = session.mapper.native_physical_at(state, session.mapper.origin.elapsed())?;
+                session.output.send(&frame)?;
+            }
+            Err(TryRecvError::Empty) => return Ok(()),
+            Err(TryRecvError::Disconnected) => return Err(invalid("configuration BLE physical-report connection disconnected")),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 /// Grab the receiver's xpad node and own uinput outputs until stop/disconnect.
 /// Opt-in gyro grabs its sibling firmware mouse; no BLE or raw IMU is used.
 pub fn run_receiver(
@@ -2964,6 +3072,9 @@ pub fn run_receiver(
     slot_map: Option<crate::profile::KeyMap>,
     stopped: Arc<AtomicBool>,
 ) -> Result<()> {
+    if profile.native_gyro_clutch {
+        return Err(invalid("native gyro clutch requires configuration BLE; use run_native_clutch"));
+    }
     run_evdev(device, profile, slot_map, stopped, LinkKind::Receiver)
 }
 
@@ -3036,14 +3147,14 @@ fn run_evdev(
     if let Some(notice) = notice { eprintln!("{notice}"); }
     session.source.grab()?;
     if let Some(mouse) = session.receiver_mouse.as_mut() { mouse.grab()?; }
-    let result = receiver_loop(&mut session, physical.as_mut(), &stopped);
+    let result = receiver_loop(&mut session, physical.as_mut(), None, &stopped);
     let cleanup = session.close();
     result?;
     cleanup
 }
 
 #[cfg(target_os = "linux")]
-fn receiver_loop(session: &mut Session, mut physical: Option<&mut crate::receiver::Receiver>, stopped: &AtomicBool) -> Result<()> {
+fn receiver_loop(session: &mut Session, mut physical: Option<&mut crate::receiver::Receiver>, native: Option<&Receiver<PhysicalInput>>, stopped: &AtomicBool) -> Result<()> {
     let fd = session.source.file.as_raw_fd();
     let mouse_fd = session.receiver_mouse.as_ref().map_or(-1, |mouse| mouse.file.as_raw_fd());
     let mut bytes = [0u8; size_of::<RawEvent>() * 64];
@@ -3066,8 +3177,8 @@ fn receiver_loop(session: &mut Session, mut physical: Option<&mut crate::receive
         ioctl_read(fd, ioctl_code(2, b'E', 0x40 + code as u8, size_of::<AxisInfo>()), &mut axis)?;
         session.mapper.pending_analog[index] = axis.value;
     }
-    session.mapper.origin = Instant::now();
-    let initial = session.mapper.receiver_event(Event::default(), Duration::ZERO)?;
+    if native.is_none() { session.mapper.origin = Instant::now(); }
+    let initial = session.mapper.receiver_event(Event::default(), session.mapper.origin.elapsed())?;
     session.output.send(&initial)?;
     while !stopped.load(Ordering::Acquire) && !crate::interrupted() {
         if let Some(receiver) = physical.as_mut() {
@@ -3087,6 +3198,7 @@ fn receiver_loop(session: &mut Session, mut physical: Option<&mut crate::receive
             if error.kind() == io::ErrorKind::Interrupted { continue; }
             return Err(error.into());
         }
+        if let Some(physical) = native { drain_native(session, physical)?; }
         // Gamepad first: apply clutch edges before motion from the same poll.
         for (index, descriptor) in descriptors.iter().enumerate() {
             if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
@@ -3127,6 +3239,50 @@ fn receiver_loop(session: &mut Session, mut physical: Option<&mut crate::receive
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_clutch_preserves_usb_controls_and_restores_latest_mixed_stick() {
+        let profile = HostProfile { native_gyro_clutch: true, ..HostProfile::default() };
+        let mut mapper = Mapper::new_receiver(&profile, receiver_axes()).unwrap();
+        let now = Duration::ZERO;
+        for event in [Event { kind: 1, code: 304, value: 1 }, Event { kind: 3, code: 3, value: 12000 },
+            Event { kind: 3, code: 4, value: -9000 }] {
+            mapper.receiver_event(event, now).unwrap();
+        }
+        let initial = mapper.receiver_event(Event::default(), now).unwrap();
+        assert!(has(&initial, 1, 304, 1));
+        assert!(has(&initial, 3, 3, 12000));
+        let held = mapper.native_physical_at(physical(0x40000000, [255, 0]), now).unwrap();
+        assert!(has(&held, 3, 3, 32767));
+        assert!(has(&held, 3, 4, -32768));
+        mapper.receiver_event(Event { kind: 3, code: 3, value: -20000 }, now).unwrap();
+        let suppressed = mapper.receiver_event(Event::default(), now).unwrap();
+        assert!(!has(&suppressed, 3, 3, -20000));
+        let moved = mapper.native_physical_at(physical(0x40000000, [0, 255]), Duration::from_secs(10)).unwrap();
+        assert!(has(&moved, 3, 3, -32768));
+        assert!(has(&moved, 3, 4, 32767));
+        let released = mapper.native_physical_at(physical(0, [128, 128]), Duration::from_secs(11)).unwrap();
+        assert!(has(&released, 3, 3, -20000));
+        assert!(has(&released, 3, 4, -9000));
+        let close = mapper.close();
+        assert!(has(&close, 1, 304, 0));
+        assert!(has(&close, 3, 3, 0));
+    }
+
+    #[test]
+    fn native_profile_rejects_conflicting_sources_and_old_json_defaults_off() {
+        let old: HostProfile = serde_json::from_str("{}").unwrap();
+        assert!(!old.native_gyro_clutch);
+        let mut profile = HostProfile { native_gyro_clutch: true, ..old };
+        assert!(profile.validate_for_link(LinkKind::Receiver).is_ok());
+        assert!(profile.validate_for_link(LinkKind::Wired).is_err());
+        assert!(profile.validate_for_link(LinkKind::Bluetooth).is_err());
+        profile.receiver_gyro = true;
+        assert!(profile.validate_for_link(LinkKind::Receiver).is_err());
+        profile.receiver_gyro = false;
+        profile.mappings.insert("BTN_TRIGGER_HAPPY2".into(), "BTN_SOUTH".into());
+        assert!(profile.validate_for_link(LinkKind::Receiver).is_err());
+    }
+
 
     #[cfg(target_os = "linux")]
     pub(super) struct Sysfs {

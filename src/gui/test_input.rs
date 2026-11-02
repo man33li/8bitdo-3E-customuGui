@@ -133,8 +133,93 @@ impl WiredReader {
 #[cfg(test)]
 fn test_axes()->[AxisInfo;8]{std::array::from_fn(|i|AxisInfo{minimum:if i<4{-32768}else if i<6{0}else{-1},maximum:if i<4{32767}else if i==4{1023}else if i==5{2047}else{1},..AxisInfo::default()})}
 
+/// Live motion for the Test page. Bluetooth: raw IMU from the gaming HID report (ID 1,
+/// 32 bytes; accel i16×3 at 15, gyro i16×3 at 21, unchanged on firmware 1.38, live
+/// 2026-10-25). Receiver/cable: only the firmware's gyro-as-mouse output, if enabled.
+#[derive(Clone,Copy,Debug,PartialEq)]
+pub struct Motion { pub gyro_dps:[f32;3], pub accel_g:Option<[f32;3]> }
+
+const GYRO_DPS_PER_UNIT:f32=2000.0/32767.0;
+// Inferred from ≈8031 counts on the vertical axis at rest (1 g); not a published scale.
+const ACCEL_UNITS_PER_G:f32=8192.0;
+
+pub(crate) fn bluetooth_motion(report:&[u8])->Option<Motion>{
+    if report.len()!=32||report[0]!=1{return None;}
+    let axis=|at:usize|f32::from(i16::from_le_bytes([report[at],report[at+1]]));
+    Some(Motion{gyro_dps:[21,23,25].map(|at|axis(at)*GYRO_DPS_PER_UNIT),accel_g:Some([15,17,19].map(|at|axis(at)/ACCEL_UNITS_PER_G))})
+}
+
+#[cfg(target_os = "linux")]
+enum MotionSource { Bluetooth(File), ReceiverMouse{file:File,counts:[i32;2],since:std::time::Instant} }
+#[cfg(target_os = "linux")]
+pub(crate) struct MotionReader(MotionSource);
+#[cfg(target_os = "linux")]
+impl MotionReader {
+    /// Passive and non-grabbing; None when the link carries no motion data.
+    pub(crate) fn open(devices:&[crate::input::DeviceInfo])->Option<Self>{
+        use crate::input::LinkKind;
+        let open=|path:&Path|OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK|libc::O_CLOEXEC|libc::O_NOFOLLOW).open(path).ok();
+        if let Some(path)=devices.iter().find(|d|d.link==LinkKind::Bluetooth).and_then(|d|d.hidraw.as_deref()){
+            return open(path).map(|file|Self(MotionSource::Bluetooth(file)));
+        }
+        let receiver=devices.iter().find(|d|d.link==LinkKind::Receiver)?;
+        let profile=crate::input::HostProfile{receiver_gyro:true,..crate::input::HostProfile::default()};
+        let path=crate::input::receiver_mouse_path(&profile,receiver,Path::new("/sys/class/input")).ok()??;
+        open(&path).map(|file|Self(MotionSource::ReceiverMouse{file,counts:[0;2],since:std::time::Instant::now()}))
+    }
+    /// Newest sample; None while nothing new is available.
+    pub(crate) fn poll(&mut self)->Option<Motion>{
+        match &mut self.0 {
+            MotionSource::Bluetooth(file)=>{
+                let mut newest=None;let mut report=[0u8;64];
+                for _ in 0..64{match file.read(&mut report){Ok(n)=>{if let Some(m)=bluetooth_motion(&report[..n]){newest=Some(m);}},Err(_)=>break}}
+                newest
+            }
+            MotionSource::ReceiverMouse{file,counts,since}=>{
+                let mut bytes=[0;size_of::<RawEvent>()*64];
+                while let Ok(n)=file.read(&mut bytes){
+                    if n==0{break;}
+                    for chunk in bytes[..n-n%size_of::<RawEvent>()].chunks_exact(size_of::<RawEvent>()){
+                        // SAFETY: complete repr(C) Linux input_event; byte buffer may be unaligned.
+                        let raw=unsafe{std::ptr::read_unaligned(chunk.as_ptr().cast::<RawEvent>())};
+                        if raw.kind==2&&raw.code<2{counts[usize::from(raw.code)]+=raw.value;}
+                    }
+                }
+                // Rate over ≥100 ms windows: single 4-ms reports are too coarse to read.
+                let elapsed=since.elapsed().as_secs_f32();
+                if elapsed<0.1{return None;}
+                let rate=|c:i32|c as f32/(elapsed*crate::input::RECEIVER_COUNTS_PER_DEGREE as f32);
+                // Mouse X = yaw, mouse Y = pitch (screen down = tilt down).
+                let motion=Motion{gyro_dps:[-rate(counts[1]),rate(counts[0]),0.0],accel_g:None};
+                *counts=[0;2];*since=std::time::Instant::now();Some(motion)
+            }
+        }
+    }
+    pub(crate) fn is_receiver_mouse(&self)->bool{matches!(self.0,MotionSource::ReceiverMouse{..})}
+}
+#[cfg(target_os = "windows")]
+pub(crate) enum MotionReader {}
+#[cfg(target_os = "windows")]
+impl MotionReader {
+    pub(crate) fn open(_devices:&[crate::input::DeviceInfo])->Option<Self>{None}
+    pub(crate) fn poll(&mut self)->Option<Motion>{match *self {}}
+    pub(crate) fn is_receiver_mouse(&self)->bool{match *self {}}
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bluetooth_motion_decodes_live_firmware_138_report(){
+        // Captured 2026-10-25 at rest (firmware 1.38): accel ≈(-0.01,-0.002,0.98) g, gyro ≈0.
+        let report=decode("0108807f7e7f000000000000000064c1ffe4ff5d1f0100ffff0000c6167d0f00");
+        let m=bluetooth_motion(&report).unwrap();
+        assert_eq!(m.gyro_dps,[1.0,-1.0,0.0].map(|v:f32|v*GYRO_DPS_PER_UNIT));
+        let [ax,ay,az]=m.accel_g.unwrap();
+        assert_eq!([ax,ay,az],[-63.0/8192.0,-28.0/8192.0,8029.0/8192.0]);
+        assert!(bluetooth_motion(&report[..31]).is_none(),"length is checked");
+        let mut other=report;other[0]=2;assert!(bluetooth_motion(&other).is_none(),"report id is checked");
+    }
+    fn decode(hex:&str)->[u8;32]{std::array::from_fn(|i|u8::from_str_radix(&hex[i*2..i*2+2],16).unwrap())}
     use super::*;
     #[test]
     fn ble_physical_buttons_axes_and_paddles_are_not_xinput_bits(){
@@ -155,6 +240,7 @@ mod tests {
         state.event(Event{kind:1,code:304,value:0}).unwrap();let pad=state.event(Event::default()).unwrap().unwrap();assert_eq!(pad.buttons&15,9);assert_eq!(pad.buttons&4096,0);assert_eq!((pad.left_trigger,pad.right_trigger),(0,255));
         assert!(state.event(Event{kind:0,code:3,value:0}).is_err());
     }
+    #[cfg(target_os = "linux")]
     #[test]
     fn wired_reader_consumes_linux_events_and_coalesces_frames(){
         use std::{io::Write,os::{fd::OwnedFd,unix::net::UnixStream}};

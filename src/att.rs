@@ -8,6 +8,7 @@ use std::{
     io,
     sync::{Arc, atomic::{AtomicBool, Ordering}},
     thread,
+    sync::mpsc,
     time::{Duration, Instant},
 };
 #[cfg(target_os = "linux")]
@@ -29,7 +30,7 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-pub use windows::{AttClient, run_controller, scan};
+pub use windows::{AttClient, scan};
 #[cfg(target_os = "windows")]
 use windows::Characteristic;
 
@@ -1174,6 +1175,29 @@ impl Connection {
         Ok(None)
     }
 
+    pub(crate) fn prepare_mapper(
+        &mut self,
+        profile: &crate::input::HostProfile,
+        slot_map: Option<crate::profile::KeyMap>,
+    ) -> Result<(Option<crate::profile::Profiles>, Option<crate::profile::KeyMap>, protocol::PhysicalInput)> {
+        let profiles = if profile.native_gyro_clutch || slot_map.is_none() {
+            let bytes = self.read_profiles()?;
+            let image: &[u8; crate::profile::IMAGE_SIZE] = bytes.as_slice().try_into()
+                .map_err(|_| invalid("Bluetooth returned incomplete profiles"))?;
+            let profiles = crate::profile::Profiles::decode(image)?;
+            if profile.native_gyro_clutch {
+                validate_native_setup(&profiles, profile)?;
+                eprintln!("Turn firmware motion on once using its configured toggle button; its current toggle state cannot be read.");
+            }
+            Some(profiles)
+        } else { None };
+        let slot_map = if profile.native_gyro_clutch { None } else {
+            slot_map.or_else(|| profiles.as_ref()?.selected_slot().map(|slot| slot.key_map.clone()))
+        };
+        let first = self.enable_physical()?;
+        Ok((profiles, slot_map, first))
+    }
+
     #[cfg(target_os = "linux")]
     pub fn close(&mut self) -> Result<()> {
         if self.client.alive.load(Ordering::Relaxed) {
@@ -1182,8 +1206,38 @@ impl Connection {
         Ok(())
     }
 }
+fn validate_native_setup(profiles: &crate::profile::Profiles, host: &crate::input::HostProfile) -> Result<()> {
+    use crate::profile::{Axis, EnableMethod, MappingTarget, MotionTarget, PhysicalButton, PhysicalButtons, Side, RECORD_MAGIC};
+    let slot = profiles.selected_slot().filter(|slot| slot.is_valid())
+        .ok_or_else(|| invalid("native gyro clutch requires a valid selected controller slot 0..2"))?;
+    let source = match host.button.as_str() {
+        "R4" => PhysicalButton::R4,
+        "L4" => PhysicalButton::L4,
+        "PL" => PhysicalButton::P1,
+        "PR" => PhysicalButton::P2,
+        _ => return Err(invalid("native gyro clutch requires a physical paddle")),
+    };
+    let motion = &slot.motion;
+    let enable = motion.enable_button.bits();
+    if motion.flag != RECORD_MAGIC || !motion.feature.unlabeled_flag()
+        || motion.feature.target() != MotionTarget::RightStick
+        || motion.feature.enable_method() != EnableMethod::Toggle
+        || enable.count_ones() != 1 || enable & !PhysicalButtons::KNOWN != 0
+        || enable == source.mask().bits() || !motion.sensitivity.is_valid() {
+        return Err(invalid("native gyro clutch requires enabled right-stick motion and a different physical press-toggle button"));
+    }
+    if slot.key_map.flag != RECORD_MAGIC || slot.key_map.get(source) != MappingTarget::None {
+        return Err(invalid("set the clutch paddle mapping to None in the active controller slot"));
+    }
+    if slot.feature.swaps_sticks() || slot.feature.inverted(Side::Right, Axis::X)
+        || slot.feature.inverted(Side::Right, Axis::Y) {
+        return Err(invalid("native gyro clutch requires unswapped, uninverted controller right stick"));
+    }
+    Ok(())
+}
 
-#[cfg(target_os = "linux")]
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 /// Own both input sources; a failure on either source tears down the virtual pad.
 pub fn run_controller(
     device: Option<&std::path::Path>,
@@ -1193,6 +1247,8 @@ pub fn run_controller(
     timeout: Duration,
     stopped: Arc<AtomicBool>,
 ) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    crate::input::recover_owned_output()?;
     // The CLI also selects receiver/wired devices; their runtime validates link policy.
     let controllers = crate::input::devices()?;
     let candidates: Vec<_> = controllers
@@ -1207,25 +1263,27 @@ pub fn run_controller(
         }));
     }
     let device = candidates[0].path.clone();
-    match candidates[0].link {
-        crate::input::LinkKind::Receiver => return crate::input::run_receiver(Some(&device), profile, slot_map, stopped),
-        crate::input::LinkKind::Wired => return crate::input::run_wired(Some(&device), profile, stopped),
-        crate::input::LinkKind::Bluetooth => profile.validate()?,
+    let link = candidates[0].link;
+    profile.validate_runtime(link)?;
+    if !profile.native_gyro_clutch {
+        match link {
+            crate::input::LinkKind::Receiver => return crate::input::run_receiver(Some(&device), profile, slot_map, stopped),
+            crate::input::LinkKind::Wired => return crate::input::run_wired(Some(&device), profile, stopped),
+            crate::input::LinkKind::Bluetooth => (),
+        }
     }
     let mut connection = Connection::open(address, timeout, stopped.clone())?;
-    let slot_map = if slot_map.is_none() {
-        let bytes = connection.read_profiles()?;
-        let image: &[u8; crate::profile::IMAGE_SIZE] = bytes.as_slice().try_into()
-            .map_err(|_| invalid("Bluetooth returned incomplete profiles"))?;
-        crate::profile::Profiles::decode(image)?.selected_slot().map(|slot| slot.key_map.clone())
-    } else { slot_map };
-    let first = connection.enable_physical()?;
+    let (_, slot_map, first) = connection.prepare_mapper(profile, slot_map)?;
     let (sender, receiver) = mpsc::sync_channel(32);
     sender.send(first)?;
     let input_profile = profile.clone();
     let input_stop = stopped.clone();
     let worker = thread::spawn(move || {
-        crate::input::run(Some(&device), &input_profile, slot_map, receiver, input_stop)
+        if input_profile.native_gyro_clutch {
+            crate::input::run_native_clutch(Some(&device), &input_profile, receiver, input_stop)
+        } else {
+            crate::input::run(Some(&device), &input_profile, slot_map, receiver, input_stop)
+        }
     });
     let mut radio_error = None;
     while !worker.is_finished() && !stopped.load(Ordering::Relaxed) && !interrupted() {
@@ -1241,27 +1299,61 @@ pub fn run_controller(
             }
             Ok(None) => (),
             Err(error) => {
-                radio_error = Some(error);
+                let cancelled = (stopped.load(Ordering::Relaxed) || interrupted())
+                    && error.downcast_ref::<io::Error>().is_some_and(|e| e.kind() == io::ErrorKind::Interrupted);
+                if !cancelled { radio_error = Some(error); }
                 break;
             }
         }
     }
     stopped.store(true, Ordering::Relaxed);
+    let input_result = worker.join()
+        .map_err(|_| invalid("Input worker panicked"))
+        .and_then(|result| result);
     drop(sender);
-    let input_result = worker
-        .join()
-        .map_err(|_| invalid("Input worker panicked"))?;
     let close_result = connection.close();
-    if let Some(error) = radio_error {
-        return Err(error);
+    let result = radio_error.map_or(input_result, Err);
+    match (result, close_result) {
+        (Err(error), Err(close)) => Err(invalid(format!("{error}; Bluetooth cleanup also failed: {close}"))),
+        (Err(error), _) => Err(error),
+        (_, close) => close,
     }
-    input_result?;
-    close_result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_setup_requires_valid_slot_toggle_and_unmapped_clutch() {
+        use crate::profile::{MappingTarget, MotionTarget, PhysicalButton, PhysicalButtons, EnableMethod, RECORD_MAGIC};
+        let mut bytes = [0u8; crate::profile::IMAGE_SIZE];
+        let magic = RECORD_MAGIC.to_le_bytes();
+        bytes[4..8].copy_from_slice(&magic);
+        bytes[0x28..0x2c].copy_from_slice(&magic);
+        bytes[0xfc..0x100].copy_from_slice(&magic);
+        let mut profiles = crate::profile::Profiles::decode(&bytes).unwrap();
+        let slot = &mut profiles.slots[0];
+        slot.motion.feature.set_target(MotionTarget::RightStick).unwrap();
+        slot.motion.feature.set_enable_method(EnableMethod::Toggle);
+        slot.motion.set_enable_button(PhysicalButtons::P1).unwrap();
+        slot.key_map.set(PhysicalButton::R4, MappingTarget::None).unwrap();
+        let mut image = profiles.encode();
+        image[0x100] |= 8;
+        profiles = crate::profile::Profiles::decode(&image).unwrap();
+        let host = crate::input::HostProfile { native_gyro_clutch: true, ..Default::default() };
+        assert!(validate_native_setup(&profiles, &host).is_ok());
+        profiles.slots[0].key_map.set(PhysicalButton::R4, MappingTarget::R3).unwrap();
+        assert!(validate_native_setup(&profiles, &host).is_err());
+        profiles.slots[0].key_map.set(PhysicalButton::R4, MappingTarget::None).unwrap();
+        profiles.slots[0].motion.set_enable_button(PhysicalButtons::R4).unwrap();
+        assert!(validate_native_setup(&profiles, &host).is_err());
+        profiles.slots[0].motion.set_enable_button(PhysicalButtons::P1).unwrap();
+        profiles.slots[0].motion.feature.set_enable_method(EnableMethod::Hold);
+        assert!(validate_native_setup(&profiles, &host).is_err());
+        profiles.set_current_slot(1).unwrap();
+        assert!(validate_native_setup(&profiles, &host).is_err());
+    }
+
     #[test]
     fn advertisements_merge_scan_responses_without_erasing_identity() {
         let mut advertisements = Advertisements::default();

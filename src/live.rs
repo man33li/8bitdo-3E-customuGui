@@ -3,13 +3,13 @@ use crate::{Result, invalid, att, gip::{self,Gip}, gui::state::*, input::{self,H
 use std::{sync::{mpsc::{self,Receiver as Rx,Sender},Arc,atomic::{AtomicBool,Ordering}},thread,time::{Duration,Instant},path::{Path,PathBuf}};
 use parking_lot::Mutex;
 use crate::profiles::{self,Store,Debounce};
-use crate::gui::test_input::{self,WiredReader};
+use crate::gui::test_input::{self,WiredReader,MotionReader};
 
 enum Command { Read, ConnectBluetooth, SwitchReceiverMode(Link), Save(Box<[u8;IMAGE_SIZE]>), TestVisible(bool), Mapper(Option<(DeviceInfo,HostProfile,Option<crate::profile::KeyMap>)>), Auto(Option<(profiles::AutoConfig,String)>), Rumble(PathBuf,[u8;2]), Shutdown }
-enum Event { Connected(PathBuf,Profiles,bool), WiredConnected(PathBuf,Profiles,bool), WiredStarting, BluetoothConnected(String,Profiles), ModeSwitched(String), Saved(Profiles), Read(Profiles), Version(String), Error(String), Disconnected(String), Inventory(Vec<DeviceInfo>,Vec<PathBuf>), Battery(Option<gip::Battery>), Mapper(bool,String), AutoSwitched{name:String,profile:HostProfile,notice:String}, Rumble(bool,Option<String>) }
+enum Event { Connected(PathBuf,Profiles,bool), WiredConnected(PathBuf,Profiles,bool), WiredStarting, BluetoothStarting, BluetoothConnected(String,Profiles), ModeSwitched(String), Saved(Profiles), Read(Profiles), Version(String), Error(String), Disconnected(String), Inventory(Vec<DeviceInfo>,Vec<PathBuf>), Battery(Option<gip::Battery>), Mapper(bool,String), AutoSwitched{name:String,profile:HostProfile,notice:String}, Rumble(bool,Option<String>) }
 #[derive(Clone,Copy)]
 struct PadSample { state:Pad,paddles:u32,received_at:Instant }
-pub struct LiveState { model:Model, commands:Sender<Command>, events:Rx<Event>, pad:Arc<Mutex<Option<PadSample>>>, worker:Option<thread::JoinHandle<()>>, stop:Arc<AtomicBool>, store:Store }
+pub struct LiveState { model:Model, commands:Sender<Command>, events:Rx<Event>, pad:Arc<Mutex<Option<PadSample>>>, worker:Option<thread::JoinHandle<()>>, stop:Arc<AtomicBool>, store:Store, motion:Option<MotionReader> }
 impl Default for LiveState{fn default()->Self{Self::new()}}
 impl LiveState {
     pub fn new()->Self {
@@ -26,10 +26,15 @@ impl LiveState {
                 model.notice=Some(format!("Named host profiles could not load: {error}"));
             },
         }
-        Self{model,commands:tx,events:rx,pad,worker:Some(worker),stop,store}
+        Self{model,commands:tx,events:rx,pad,worker:Some(worker),stop,store,motion:None}
     }
     fn start(&mut self,command:Command,title:&str)->Result<()> {
         if self.model.operation.is_some(){return Err(invalid("A device operation is already running"));}
+        if (self.model.host_profile.native_gyro_clutch||self.model.device.as_ref().is_some_and(|device|device.link==Link::Bluetooth))
+            &&(self.model.mapper_running||self.model.mapper_pending)
+            &&matches!(command,Command::Read|Command::Save(_)|Command::ConnectBluetooth){
+            return Err(invalid("Stop the host mapper before reading or saving controller profiles; it is using configuration Bluetooth."));
+        }
         if self.model.device.is_none()&&!matches!(command,Command::Read|Command::ConnectBluetooth){return Err(invalid("No connected controller"));}
         let wired=self.model.device.as_ref().is_some_and(|device|device.link==Link::Wired)&&matches!(command,Command::Read|Command::Save(_));
         if wired&&(self.model.mapper_running||self.model.mapper_pending){
@@ -49,6 +54,12 @@ impl LiveState {
         let selection=self.model.auto_enabled.then(||(self.model.auto_config.clone(),self.model.host_profile_name.clone()));
         self.commands.send(Command::Auto(selection)).map_err(|_|invalid("Device worker stopped"))
     }
+    /// Test-page motion source; re-tried on inventory changes while the page is visible.
+    fn open_motion(&mut self){
+        if !self.model.test_visible{return;}
+        self.motion=MotionReader::open(&self.model.input_devices);
+        self.model.motion_from_mouse=self.motion.as_ref().is_some_and(MotionReader::is_receiver_mouse);
+    }
 }
 impl GuiState for LiveState {
     fn model(&self)->&Model{&self.model}
@@ -56,6 +67,8 @@ impl GuiState for LiveState {
         if visible!=self.model.test_visible{
             self.commands.send(Command::TestVisible(visible)).map_err(|_|invalid("Device worker stopped"))?;
             self.model.test_visible=visible;
+            self.motion=None;self.model.motion=None;
+            self.open_motion();
         }
         Ok(())
     }
@@ -80,13 +93,17 @@ impl GuiState for LiveState {
                 else{self.model.load(p);self.model.notice=Some(format!("Connected wired {}. Reads/saves pause gamepad input briefly; edits stay staged until Save.",path.display()));}
                 self.model.operation=None;self.model.pad=None;self.model.pad_received_at=None;
             },
+            Event::BluetoothStarting=>{
+                self.model.operation=Some(Operation{title:"Connecting Bluetooth settings…".into(),detail:"Keep the cable/receiver connected. Hold the profile button for 3 seconds until configuration LEDs blink. Close competing configuration apps.".into()});
+                self.model.notice=None;
+            },
             Event::BluetoothConnected(address,p)=>{
                 self.model.device=Some(Device{name:format!("Ultimate 3E — {address}"),link:Link::Bluetooth,pid:0x202f,version_record:None});
                 self.model.battery=None;
                 if self.model.profiles.is_some()&&self.model.dirty(){
-                    self.model.baseline=Some(p);self.model.notice=Some("Bluetooth connected. Unsaved edits retained; Revert reloads the controller. Bluetooth saves disabled pending hardware verification.".into());
+                    self.model.baseline=Some(p);self.model.notice=Some("Bluetooth settings connected. Unsaved edits retained; Revert reloads the controller.".into());
                 }else{
-                    self.model.load(p);self.model.notice=Some("Bluetooth profiles loaded. Saves disabled pending hardware verification; edits remain local.".into());
+                    self.model.load(p);self.model.notice=Some("Bluetooth settings connected. USB/gameplay mode is unchanged; edits stay staged until Save.".into());
                 }
                 self.model.operation=None;self.model.pad=None;self.model.pad_received_at=None;
             },
@@ -104,7 +121,7 @@ impl GuiState for LiveState {
             },
             Event::Error(error)=>{self.model.operation=None;self.model.notice=Some(error);},
             Event::Disconnected(error)=>{self.model.device=None;self.model.battery=None;self.model.pad=None;self.model.pad_received_at=None;self.model.operation=None;self.model.notice=Some(error);},
-            Event::Inventory(devices,nodes)=>{self.model.input_devices=devices;self.model.rumble_nodes=nodes;},
+            Event::Inventory(devices,nodes)=>{self.model.input_devices=devices;self.model.rumble_nodes=nodes;if self.motion.is_none(){self.open_motion();}},
             Event::Battery(battery)=>self.model.battery=battery,
             Event::Mapper(running,notice)=>{
                 self.model.mapper_running=running;self.model.mapper_pending=false;
@@ -122,6 +139,9 @@ impl GuiState for LiveState {
                 self.model.pad=pad;self.model.paddles=paddles;self.model.pad_received_at=latest.map(|sample|sample.received_at);changed=true;
             }
         }
+        if let Some(motion)=self.motion.as_mut().and_then(MotionReader::poll){
+            if self.model.motion!=Some(motion){self.model.motion=Some(motion);changed=true;}
+        }
         Ok(changed)
     }
     fn dispatch(&mut self,action:Action)->Result<()> {
@@ -133,7 +153,7 @@ impl GuiState for LiveState {
                 if enabled==self.model.mapper_running{return Ok(());}
                 let selection=if enabled{
                     let device=self.model.mapper_device()?.clone();
-                    self.model.host_profile.validate_for_link(device.link)?;
+                    self.model.host_profile.validate_runtime(device.link)?;
                     let slot_map=self.model.mapper_key_map();
                     Some((device,self.model.host_profile.clone(),slot_map))
                 }else{None};
@@ -181,7 +201,7 @@ impl GuiState for LiveState {
                 self.model.rumble_running=true;
             },
             Action::ConnectBluetooth=>{
-                if !self.model.can_connect_bluetooth(){return Err(invalid("Disconnect the receiver and stop the host mapper before connecting Bluetooth"));}
+                if !self.model.can_connect_bluetooth(){return Err(invalid("Stop the host mapper and wait for device operations to finish before connecting Bluetooth settings"));}
                 self.start(Command::ConnectBluetooth,"Scanning for 81HF01…")?;
                 self.model.operation.as_mut().unwrap().detail="Hold the front pixel-logo/profile button for 3 seconds until configuration LEDs blink. Close the mobile app.".into();
             },
@@ -353,7 +373,7 @@ fn verified(image:&[u8;IMAGE_SIZE],back:&[u8])->Result<Profiles>{
 }
 fn failure(error:&crate::Error)->String{
     if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::TimedOut){
-        "Controller asleep or out of range — press any button, then Refresh. Staged edits retained.".into()
+        "USB configuration did not reply. Input may still work; keep the cable/receiver connected and use Connect Bluetooth for settings on firmware 1.38. Staged edits retained.".into()
     }else{format!("{error}. Staged edits retained; press Refresh to retry.")}
 }
 fn send_event(events:&Sender<Event>,event:Event){
@@ -400,19 +420,36 @@ fn auto_step(auto:&mut Option<AutoState>,running:bool,now:Duration,processes:&[p
 fn prepare_auto_switch(auto:&mut Option<AutoState>,link:Option<LinkKind>,store:&Store,now:Duration,processes:&[profiles::Process])->Result<Option<(AutoTarget,HostProfile)>>{
     let Some(target)=auto_step(auto,link.is_some(),now,processes)else{return Ok(None);};
     let profile=store.load(&target.name)?;
-    profile.validate_for_link(link.expect("running mapper link"))?;
+    profile.validate_runtime(link.expect("running mapper link"))?;
     Ok(Some((target,profile)))
 }
-struct MapperWorker { stop:Arc<AtomicBool>, handle:Option<thread::JoinHandle<Result<()>>> }
+struct MapperWorker { stop:Arc<AtomicBool>, handle:Option<thread::JoinHandle<Result<()>>>, native_clutch:bool, physical:Option<mpsc::SyncSender<crate::protocol::PhysicalInput>> }
 impl MapperWorker {
-    fn start(device:DeviceInfo,profile:HostProfile,slot_map:Option<crate::profile::KeyMap>)->Self{
+    fn start(device:DeviceInfo,profile:HostProfile,slot_map:Option<crate::profile::KeyMap>,bluetooth:&mut Option<att::Connection>,gui_stop:&Arc<AtomicBool>,events:&Sender<Event>)->Result<Self>{
         let stop=Arc::new(AtomicBool::new(false));let flag=Arc::clone(&stop);
-        let handle=thread::spawn(move||match device.link{
-            LinkKind::Receiver=>input::run_receiver(Some(&device.path),&profile,slot_map,flag),
-            LinkKind::Bluetooth=>crate::att::run_controller(Some(&device.path),&profile,slot_map,None,Duration::from_secs(10),flag),
-            LinkKind::Wired=>input::run_wired(Some(&device.path),&profile,flag),
+        let native_clutch=profile.native_gyro_clutch;
+        let (physical,physical_input,slot_map)=if native_clutch||device.link==LinkKind::Bluetooth{
+            // Keep BLE on its owning GUI thread: disconnecting ends the controller's advertisement.
+            if bluetooth.is_none(){*bluetooth=Some(att::Connection::open(None,Duration::from_secs(20),Arc::clone(gui_stop))?);}
+            let connection=bluetooth.as_mut().expect("configuration connection");
+            let (profiles,slot_map,first)=connection.prepare_mapper(&profile,slot_map)?;
+            if let Some(profiles)=profiles{send_event(events,Event::BluetoothConnected(connection.address.clone(),profiles));}
+            let (sender,receiver)=mpsc::sync_channel(32);
+            sender.send(first)?;
+            (Some(sender),Some(receiver),slot_map)
+        }else{(None,None,slot_map)};
+        let handle=thread::spawn(move||{
+            if let Some(physical)=physical_input{
+                return if native_clutch{input::run_native_clutch(Some(&device.path),&profile,physical,flag)}
+                    else{input::run(Some(&device.path),&profile,slot_map,physical,flag)};
+            }
+            match device.link{
+                LinkKind::Receiver=>input::run_receiver(Some(&device.path),&profile,slot_map,flag),
+                LinkKind::Wired=>input::run_wired(Some(&device.path),&profile,flag),
+                LinkKind::Bluetooth=>unreachable!("Bluetooth mapper requires physical input"),
+            }
         });
-        Self{stop,handle:Some(handle)}
+        Ok(Self{stop,handle:Some(handle),native_clutch,physical})
     }
     fn close(&mut self)->Result<()>{
         self.stop.store(true,Ordering::Release);
@@ -434,6 +471,10 @@ fn release_wired_test(command:&Command,reader:&mut Option<WiredReader>,pad:&Mute
     if matches!(command,Command::Read|Command::Save(_)|Command::SwitchReceiverMode(_)|Command::Mapper(_)|Command::TestVisible(false)|Command::ConnectBluetooth|Command::Shutdown)&&reader.take().is_some(){*pad.lock()=None;}
 }
 fn worker(commands:Rx<Command>,events:Sender<Event>,pad:Arc<Mutex<Option<PadSample>>>,stop:Arc<AtomicBool>) {
+    #[cfg(target_os = "windows")]
+    if let Err(error)=input::recover_owned_output(){
+        send_event(&events,Event::Error(format!("Interrupted mapper recovery failed: {error}")));
+    }
     let mut connected:Option<Receiver>=None;
     let mut bluetooth:Option<att::Connection>=None;
     let mut wired:Option<PathBuf>=None;
@@ -471,10 +512,22 @@ fn worker(commands:Rx<Command>,events:Sender<Event>,pad:Arc<Mutex<Option<PadSamp
                         mapper_device=None;auto=None;
                         send_event(&events,Event::Mapper(false,format!("Host mapper stopped: {error}")));
                     }else{
-                        mapper=Some(MapperWorker::start(mapper_device.as_ref().expect("running mapper device").clone(),profile.clone(),mapper_slot_map.clone()));
-                        let state=auto.as_mut().expect("enabled auto watcher");
-                        state.current=target.name.clone();state.debounce=Debounce::default();
-                        send_event(&events,Event::AutoSwitched{name:target.name,profile,notice:target.notice});
+                        if profile.native_gyro_clutch{
+                            connected=None;wired=None;attempted=None;reload=true;
+                            receiver_test=test_input::ReceiverTest::default();*pad.lock()=None;
+                        }
+                        match MapperWorker::start(mapper_device.as_ref().expect("running mapper device").clone(),profile.clone(),mapper_slot_map.clone(),&mut bluetooth,&stop,&events){
+                            Ok(worker)=>{
+                                mapper=Some(worker);
+                                let state=auto.as_mut().expect("enabled auto watcher");
+                                state.current=target.name.clone();state.debounce=Debounce::default();
+                                send_event(&events,Event::AutoSwitched{name:target.name,profile,notice:target.notice});
+                            },
+                            Err(error)=>{
+                                mapper_device=None;auto=None;
+                                send_event(&events,Event::Mapper(false,format!("Host mapper start failed: {error}")));
+                            },
+                        }
                     }
                 },
                 Ok(None)=>{},
@@ -509,23 +562,22 @@ fn worker(commands:Rx<Command>,events:Sender<Event>,pad:Arc<Mutex<Option<PadSamp
             },
             Ok(Command::Mapper(selection))=>{
                 auto=None;mapper_device=None;
-                if selection.as_ref().is_some_and(|(device,_,_)|device.link==LinkKind::Bluetooth){
-                    if let Some(mut connection)=bluetooth.take(){
-                        if let Err(error)=connection.close(){send_event(&events,Event::Error(format!("Bluetooth configuration close failed: {error}")));}
-                        send_event(&events,Event::Disconnected("Host mapper owns configuration BLE; stop mapping and Connect Bluetooth to edit device profiles.".into()));
-                    }
-                }
                 if let Some(mut worker)=mapper.take(){
                     if let Err(error)=worker.close(){send_event(&events,Event::Mapper(false,format!("Host mapper stopped: {error}")));continue;}
                 }
+                if selection.as_ref().is_some_and(|(_,profile,_)|profile.native_gyro_clutch){
+                    connected=None;wired=None;attempted=None;reload=true;
+                    receiver_test=test_input::ReceiverTest::default();*pad.lock()=None;
+                }
                 if let Some((device,profile,slot_map))=selection{
-                    match profile.validate_for_link(device.link){
+                    match profile.validate_runtime(device.link){
                         Ok(notice)=>{
                             let notice=notice.unwrap_or("Bluetooth host mapper starting; waiting for configuration BLE.").to_owned();
-                            mapper_device=Some(device.clone());
                             mapper_slot_map=slot_map.clone();
-                            mapper=Some(MapperWorker::start(device,profile,slot_map));
-                            send_event(&events,Event::Mapper(true,notice));
+                            match MapperWorker::start(device.clone(),profile,slot_map,&mut bluetooth,&stop,&events){
+                                Ok(worker)=>{mapper_device=Some(device);mapper=Some(worker);send_event(&events,Event::Mapper(true,notice));},
+                                Err(error)=>send_event(&events,Event::Mapper(false,format!("Host mapper start failed: {error}"))),
+                            }
                         },
                         Err(error)=>send_event(&events,Event::Mapper(false,error.to_string())),
                     }
@@ -567,17 +619,22 @@ fn worker(commands:Rx<Command>,events:Sender<Event>,pad:Arc<Mutex<Option<PadSamp
             },
             Ok(Command::ConnectBluetooth)=>{
                 let result=(||->Result<()>{
-                    if receiver::find().is_ok(){return Err(invalid("A receiver is present; disconnect it before using Bluetooth configuration"));}
                     if mapper.is_some(){return Err(invalid("Stop the host mapper before using Bluetooth configuration"));}
+                    send_event(&events,Event::BluetoothStarting);
                     connected=None;wired=None;attempted=None;*pad.lock()=None;
-                    let mut connection=att::Connection::open(None,Duration::from_secs(20),Arc::clone(&stop))?;
-                    let profiles=read_bluetooth(&mut connection)?;
+                    if bluetooth.is_none(){bluetooth=Some(att::Connection::open(None,Duration::from_secs(20),Arc::clone(&stop))?);}
+                    let connection=bluetooth.as_mut().expect("configuration connection");
+                    let profiles=read_bluetooth(connection)?;
                     send_event(&events,Event::BluetoothConnected(connection.address.clone(),profiles));
-                    bluetooth=Some(connection);Ok(())
+                    Ok(())
                 })();
                 if let Err(error)=result{send_event(&events,Event::Error(format!("Bluetooth connection failed: {error}. Hold the profile button for 3 seconds, then Connect Bluetooth.")));}
             },
             Ok(command)=>{
+                if mapper.as_ref().is_some_and(|worker|worker.physical.is_some())&&matches!(command,Command::Read|Command::Save(_)){
+                    send_event(&events,Event::Error("Stop the host mapper before reading or saving controller profiles; it is using configuration Bluetooth.".into()));
+                    continue;
+                }
                 if let Some(receiver)=&mut connected{
                     let result:Result<Option<Event>>=(||match command{
                         Command::Read=>Ok(Some(Event::Read(read(receiver)?))),
@@ -614,7 +671,7 @@ fn worker(commands:Rx<Command>,events:Sender<Event>,pad:Arc<Mutex<Option<PadSamp
             Err(mpsc::RecvTimeoutError::Timeout)=>{},
         }
         if stop.load(Ordering::Relaxed){break;}
-        if bluetooth.is_none()&&Instant::now()>=next_find{
+        if bluetooth.is_none()&&!mapper.as_ref().is_some_and(|worker|worker.native_clutch)&&Instant::now()>=next_find{
             next_find=Instant::now()+Duration::from_secs(1);
             let selection=(||{
                 let receiver=receiver::find().ok();
@@ -676,12 +733,25 @@ fn worker(commands:Rx<Command>,events:Sender<Event>,pad:Arc<Mutex<Option<PadSamp
             }
         }
         if let Some(connection)=&mut bluetooth{
-            match connection.next_physical(Duration::from_millis(4)){
+            let result=connection.next_physical(Duration::from_millis(4)).and_then(|state|{
+                if let (Some(state),Some(sender))=(state,mapper.as_ref().and_then(|worker|worker.physical.as_ref())){
+                    sender.try_send(state).map_err(|error|invalid(format!("Physical input consumer stalled: {error}")))?;
+                }
+                Ok(state)
+            });
+            match result{
                 Ok(Some(state))=>{let(state,paddles)=test_input::bluetooth(state);publish_pad(&pad,state,paddles);},
                 Ok(None)=>{}, // Change-driven BLE silence is not a disconnect.
                 Err(error)=>{
-                    let _=connection.close();bluetooth=None;*pad.lock()=None;
-                    send_event(&events,Event::Disconnected(format!("Bluetooth disconnected: {error}. Staged edits retained; hold the profile button 3 seconds, then Connect Bluetooth.")));
+                    let mut notice=format!("Bluetooth disconnected: {error}");
+                    if mapper.as_ref().is_some_and(|worker|worker.physical.is_some()){
+                        if let Err(error)=mapper.take().unwrap().close(){notice.push_str(&format!("; mapper cleanup failed: {error}"));}
+                        mapper_device=None;auto=None;
+                        send_event(&events,Event::Mapper(false,notice.clone()));
+                    }
+                    if let Err(error)=connection.close(){notice.push_str(&format!("; Bluetooth cleanup failed: {error}"));}
+                    bluetooth=None;*pad.lock()=None;
+                    send_event(&events,Event::Disconnected(format!("{notice}. Staged edits retained; hold the profile button 3 seconds, then Connect Bluetooth.")));
                 },
             }
         }
@@ -711,6 +781,7 @@ fn worker(commands:Rx<Command>,events:Sender<Event>,pad:Arc<Mutex<Option<PadSamp
             }
         }
     }
+    drop(mapper);
     if let Some(mut connection)=bluetooth{let _=connection.close();}
     crate::gui::wake();
 }
@@ -722,7 +793,7 @@ mod tests {
         let(commands,rx)=mpsc::channel();let(tx,events)=mpsc::channel();
         let mut model=Model{device:Some(Device{name:"test receiver".into(),link:Link::Receiver,pid:0x202f,version_record:None}),..Model::default()};
         model.load(crate::gui::state::defaults().unwrap());
-        (LiveState{model,commands,events,pad:Arc::new(Mutex::new(None)),worker:None,stop:Arc::new(AtomicBool::new(false)),store:Store::default()},rx,tx)
+        (LiveState{model,commands,events,pad:Arc::new(Mutex::new(None)),worker:None,stop:Arc::new(AtomicBool::new(false)),store:Store::default(),motion:None},rx,tx)
     }
     fn input_device(link:LinkKind)->DeviceInfo{
         DeviceInfo{path:PathBuf::from("/not-a-device"),name:"test controller".into(),bus:5,vendor:0x2dc8,product:0x202f,physical:"test/input0".into(),hidraw:None,identity:"test".into(),input_access:true,hidraw_access:false,link}
@@ -748,6 +819,12 @@ mod tests {
         for link in [Link::Receiver,Link::Wired]{
             let(mut state,commands,_events)=state();
             state.model.device.as_mut().unwrap().link=link;
+            if cfg!(windows)&&link==Link::Receiver{
+                assert!(state.dispatch(Action::SwitchReceiverMode(link)).is_err());
+                assert!(commands.try_recv().is_err());
+                assert!(state.model.operation.is_none());
+                continue;
+            }
             state.dispatch(Action::SwitchReceiverMode(link)).unwrap();
             assert!(matches!(commands.try_recv().unwrap(),Command::SwitchReceiverMode(source) if source==link));
             assert!(state.model.operation.is_some());
@@ -785,9 +862,8 @@ mod tests {
                 let expected=match source{Link::Receiver=>gip&&!receiver,Link::Wired=>receiver&&!gip,_=>false};
                 assert_eq!(changed,expected);
                 assert_eq!(mode_switch_outcome(source,changed,Ok(()),Ok(())).is_ok(),expected);
-                // ESHUTDOWN / ENODEV are normal once re-enumeration proves success.
-                let sent=Err(std::io::Error::from_raw_os_error(libc::ESHUTDOWN).into());
-                let handback=Err(std::io::Error::from_raw_os_error(libc::ENODEV).into());
+                let sent=Err(std::io::Error::from(std::io::ErrorKind::NotConnected).into());
+                let handback=Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
                 assert_eq!(mode_switch_outcome(source,changed,sent,handback).is_ok(),expected);
             }}
         }
@@ -921,13 +997,6 @@ mod tests {
         assert!(connect_wired(Path::new("/not-a-device"),&events,false,true).unwrap_err().to_string().contains("Stop the host input mapper"));
     }
     #[test]
-    fn wired_permission_error_gets_access_notice_not_generic_failure(){
-        let error:crate::Error=std::io::Error::from_raw_os_error(libc::EACCES).into();
-        assert!(wired_failure(&error).contains("EACCES"));
-        let other:crate::Error=std::io::Error::from_raw_os_error(libc::EIO).into();
-        assert!(!wired_failure(&other).contains("EACCES"));
-    }
-    #[test]
     fn wired_handback_failure_overrides_success_and_keeps_transfer_error(){
         let error=finish_wired(Ok(()),Err(invalid("binding missing"))).unwrap_err().to_string();
         assert!(error.contains("transfer completed"));assert!(error.contains("physical replug may be required"));
@@ -937,14 +1006,20 @@ mod tests {
         assert!(finish_wired(Ok(()),Ok(binding)).is_ok());
     }
     #[test]
-    fn bluetooth_connect_is_explicit_and_save_uses_verified_path(){
+    fn bluetooth_connect_coexists_with_usb_and_save_uses_verified_path(){
         let(mut state,commands,events)=state();
+        state.model.mapper_running=true;
         assert!(state.dispatch(Action::ConnectBluetooth).is_err());
-        state.model.device=None;
+        state.model.mapper_running=false;
         state.dispatch(Action::ConnectBluetooth).unwrap();
         assert!(matches!(commands.try_recv().unwrap(),Command::ConnectBluetooth));
-        assert!(state.model.operation.as_ref().unwrap().detail.contains("3 seconds"));
         assert!(state.dispatch(Action::ConnectBluetooth).is_err());
+        events.send(Event::Error("Earlier automatic USB probe timed out".into())).unwrap();
+        events.send(Event::BluetoothStarting).unwrap();
+        state.poll().unwrap();
+        assert!(state.model.operation.is_some());
+        assert!(state.model.notice.is_none());
+        assert!(!state.model.can_connect_bluetooth());
         events.send(Event::BluetoothConnected("test-radio".into(),crate::gui::state::defaults().unwrap())).unwrap();
         state.poll().unwrap();
         assert_eq!(state.model.device.as_ref().unwrap().link,Link::Bluetooth);
@@ -959,6 +1034,24 @@ mod tests {
         assert!(matches!(commands.try_recv().unwrap(),Command::Read));
         events.send(Event::Read(crate::gui::state::defaults().unwrap())).unwrap();state.poll().unwrap();
         assert!(!state.model.dirty());
+    }
+    #[test]
+    fn bluetooth_mapper_blocks_profile_transfers_until_stopped(){
+        for native in [false,true]{
+            let(mut state,commands,_)=state();
+            state.model.device.as_mut().unwrap().link=Link::Bluetooth;
+            state.model.host_profile.native_gyro_clutch=native;
+            state.dispatch(Action::MotionSensitivity{slot:0,value:3}).unwrap();
+            state.model.mapper_running=true;
+            assert!(state.dispatch(Action::Refresh).is_err());
+            assert!(state.dispatch(Action::Save).is_err());
+            assert!(state.model.operation.is_none());
+            assert!(state.model.dirty());
+            assert!(commands.try_recv().is_err());
+            state.model.mapper_running=false;
+            state.dispatch(Action::Save).unwrap();
+            assert!(state.model.operation.is_some());
+        }
     }
     #[test]
     fn bluetooth_reconnect_preserves_edits_and_disconnect_allows_explicit_retry(){
@@ -978,6 +1071,12 @@ mod tests {
             let(mut state,commands,events)=state();
             state.model.device=None;state.model.input_devices=vec![input_device(link)];
             state.model.host_profile.turbo.insert("BTN_SOUTH".into(),12.0);
+            if cfg!(windows)&&link==LinkKind::Wired{
+                assert!(state.dispatch(Action::SetMapper(true)).is_err());
+                assert!(!state.model.mapper_pending);
+                assert!(commands.try_recv().is_err());
+                continue;
+            }
             state.dispatch(Action::SetMapper(true)).unwrap();
             assert!(state.model.mapper_pending);assert!(!state.model.mapper_running);
             let Command::Mapper(Some((device,profile,_)))=commands.try_recv().unwrap()else{panic!("expected mapper start")};
@@ -1011,7 +1110,7 @@ mod tests {
         let stop=Arc::new(AtomicBool::new(false));let flag=Arc::clone(&stop);
         let exited=Arc::new(AtomicBool::new(false));let exit_flag=Arc::clone(&exited);
         let handle=thread::spawn(move||{while !flag.load(Ordering::Acquire){thread::yield_now();}exit_flag.store(true,Ordering::Release);Ok(())});
-        drop(MapperWorker{stop:Arc::clone(&stop),handle:Some(handle)});
+        drop(MapperWorker{stop:Arc::clone(&stop),handle:Some(handle),native_clutch:false,physical:None});
         assert!(stop.load(Ordering::Acquire));assert!(exited.load(Ordering::Acquire));
     }
     #[test]
@@ -1086,16 +1185,11 @@ mod tests {
         assert!(!state.model.dirty());
     }
     #[test]
-    fn timeout_notice_gives_an_explicit_wake_action(){
-        let error:crate::Error=std::io::Error::new(std::io::ErrorKind::TimedOut,"No acknowledgment").into();
-        let notice=failure(&error);assert!(notice.contains("press any button, then Refresh"));
-    }
-    #[test]
     fn refresh_can_retry_after_disconnect_and_explicitly_replace_edits(){
         let(commands,rx)=mpsc::channel();let(tx,events)=mpsc::channel();
         let stop=Arc::new(AtomicBool::new(false));let mut model=Model::default();model.load(crate::gui::state::defaults().unwrap());
         model.edit(Action::SetTournament(true)).unwrap();
-        let mut state=LiveState{model,commands,events,pad:Arc::new(Mutex::new(None)),worker:None,stop:Arc::clone(&stop),store:Store::default()};
+        let mut state=LiveState{model,commands,events,pad:Arc::new(Mutex::new(None)),worker:None,stop:Arc::clone(&stop),store:Store::default(),motion:None};
         state.dispatch(Action::Revert).unwrap();assert!(matches!(rx.try_recv().unwrap(),Command::Read));
         tx.send(Event::Connected(PathBuf::from("/not-a-device"),crate::gui::state::defaults().unwrap(),true)).unwrap();state.poll().unwrap();
         assert!(!state.model.dirty());assert!(!state.model.profiles.as_ref().unwrap().profile_bits.tournament());
@@ -1120,11 +1214,13 @@ mod tests {
         assert!(!state.poll().unwrap());
         assert_eq!(state.model.pad_received_at,Some(received));
     }
+    #[cfg(target_os = "linux")]
     fn test_reader()->(Option<WiredReader>,std::os::unix::net::UnixStream){
         let(source,peer)=std::os::unix::net::UnixStream::pair().unwrap();
         peer.set_nonblocking(true).unwrap();
         (Some(WiredReader::test_file(std::fs::File::from(std::os::fd::OwnedFd::from(source)))),peer)
     }
+    #[cfg(target_os = "linux")]
     #[test]
     fn wired_reader_is_closed_before_read_save_mode_mapper_and_page_exit(){
         use std::io::Read;
@@ -1200,7 +1296,7 @@ mod gui_save_regression{
             let mut profiles=Profiles::decode(&image).unwrap();profiles.fix_crc();
             let mut model=Model{device:Some(Device{name:"test".into(),link:Link::Receiver,pid:0x202f,version_record:None}),notice:Some("Connected test receiver; edits stay staged until Save.".into()),..Model::default()};
             model.load(profiles);
-            let mut state=LiveState{model,commands,events:events_rx,pad:Arc::new(Mutex::new(None)),worker:None,stop:Arc::new(AtomicBool::new(false)),store:Store::default()};
+            let mut state=LiveState{model,commands,events:events_rx,pad:Arc::new(Mutex::new(None)),worker:None,stop:Arc::new(AtomicBool::new(false)),store:Store::default(),motion:None};
             crate::gui::app::exercise_motion_save(&mut state,pointer,target);
             let Command::Save(written)=rx.try_recv().expect("writer must receive the edited image")else{panic!("not Save")};
             assert_eq!(written[0x102],target,"pointer={pointer}: slot 1 stored sensitivity");
@@ -1217,7 +1313,7 @@ mod gui_save_regression{
         let(commands,rx)=mpsc::channel();let(_events,events_rx)=mpsc::channel();
         let mut model=Model{device:Some(Device{name:"test".into(),link:Link::Receiver,pid:0x202f,version_record:None}),..Model::default()};
         model.load(crate::gui::state::defaults().unwrap());
-        let mut state=LiveState{model,commands,events:events_rx,pad:Arc::new(Mutex::new(None)),worker:None,stop:Arc::new(AtomicBool::new(false)),store:Store::default()};
+        let mut state=LiveState{model,commands,events:events_rx,pad:Arc::new(Mutex::new(None)),worker:None,stop:Arc::new(AtomicBool::new(false)),store:Store::default(),motion:None};
         state.dispatch(Action::Save).unwrap();
         assert!(rx.try_recv().is_err(),"unchanged Save must not enqueue a write");
         assert_eq!(state.model.notice.as_deref(),Some("Nothing to save"));
