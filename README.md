@@ -13,7 +13,7 @@ device feature listed as *working* below was verified on real hardware.
 
 Download `ultimate-control.exe` from the
 [releases page](https://github.com/man33li/8bitdo-3E-customuGui/releases) (currently
-[v0.1.0-alpha.2](https://github.com/man33li/8bitdo-3E-customuGui/releases/tag/v0.1.0-alpha.2)).
+[v0.1.0-alpha.3](https://github.com/man33li/8bitdo-3E-customuGui/releases/tag/v0.1.0-alpha.3)).
 It is a single file; verify it against the `.sha256` file published with the release.
 
 This release adds an **R4 gyro clutch over USB cable or the 2.4 GHz receiver**, working on
