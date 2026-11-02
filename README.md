@@ -4,10 +4,107 @@ Native replacement for **8BitDo Ultimate Software X** (Windows 1.4.9.0), written
 [Clay](https://github.com/nicbarker/clay) + raylib GUI. It edits the settings stored in an
 **8BitDo Ultimate 3E** controller and adds host-side, Steam-Input-style remapping.
 Linux supports the existing host mapper. Windows 11 x64 has native HID/Bluetooth configuration
-and a ViGEmBus/HidHide right-stick mapper; see the verification limits and driver setup below.
+and a ViGEmBus/HidHide right-stick mapper; see [Windows quick start](#windows-quick-start).
 
 The protocol was recovered from the original Windows binaries (see `reconstruction/`) and every
 device feature listed as *working* below was verified on real hardware.
+
+## Windows quick start
+
+Download `ultimate-control.exe` from the
+[releases page](https://github.com/man33li/8bitdo-3E-customuGui/releases) (currently
+[v0.1.0-alpha.2](https://github.com/man33li/8bitdo-3E-customuGui/releases/tag/v0.1.0-alpha.2)).
+It is a single file; verify it against the `.sha256` file published with the release.
+
+This release adds an **R4 gyro clutch over USB cable or the 2.4 GHz receiver**, working on
+firmware 1.38: hold **R4** (or L4/PL/PR) to pause gyro aiming while you reposition the
+controller, and release it to resume. While held, the physical right stick and R3 still work.
+The clutch reads the physical paddle and right stick over the controller's
+**configuration Bluetooth** link, while gameplay stays on cable/receiver. Games see a
+**virtual Xbox 360 controller** (ViGEmBus); the real controller is hidden from them with
+**HidHide** so they don't see double input.
+
+### Requirements
+
+- Windows 11 x64.
+- **A working Bluetooth adapter on the PC**, even when you play over cable or the 2.4 GHz receiver.
+- 8BitDo Ultimate 3E in **PC mode** (`2dc8:3024`) over USB cable or the 2.4 GHz receiver.
+  Xbox mode (`2dc8:202f`) has no gyro source.
+- [ViGEmBus v1.22.0](https://github.com/nefarius/ViGEmBus/releases/tag/v1.22.0) (final version)
+  and [HidHide](https://github.com/nefarius/HidHide/releases).
+
+The app never installs drivers, never asks for administrator rights and never disables
+Windows security features. Reboot if a driver installer asks for it.
+
+### Setup
+
+**1. Install the drivers (once)**
+
+1. Install ViGEmBus v1.22.0 (retired project; this final setup also removes its old updater).
+2. Install HidHide, then **close the HidHide configuration client**. While it is open, the mapper cannot start.
+3. Close 8BitDo Ultimate Software and the 8BitDo mobile app; they compete for the configuration link.
+
+**2. Connect the controller**
+
+1. Plug in the 2.4 GHz receiver (or the USB cable) with the controller in PC mode.
+2. Start `ultimate-control.exe gui`. Home should say **Gamepad detected**.
+3. Hold the **front pixel-logo/profile button for about 3 seconds** until the configuration
+   LEDs blink. Leave the cable/receiver connected.
+4. Click **Home → Connect Bluetooth**. Home shows **Settings connected** and the active slot.
+
+**3. Configure the controller slot (once)**
+
+1. Back up first: close the GUI, hold the profile button until the LEDs blink, run
+   `ultimate-control.exe backup ultimate-backup.bin` in PowerShell, then restart the GUI and
+   reconnect (steps 2.2–2.4).
+2. In the active slot, open **Motion**: target **Right stick**, enable method **Press-toggle**,
+   enable button **PL** (anything except the clutch button).
+3. On **Mapping → Back**, set **R4 to None**. Keep right-stick inversion and stick swap off.
+4. Click **Save + verify**, power-cycle the controller and select that slot again (short press
+   of the profile button). Repeat steps 2.3–2.4 to reconnect settings.
+
+**4. Configure the host profile (once)**
+
+1. Open **Remap**, enable **USB / 2.4 GHz native-stick clutch (Bluetooth-assisted)** and choose **R4**.
+2. Click **Save host profile**.
+
+**5. Play**
+
+1. Turn on **Home → Host input mapper**. The physical pad is hidden and a virtual Xbox 360
+   controller appears.
+2. Press **PL once** to turn firmware gyro on (its state can't be read, so the app does not
+   toggle it for you).
+3. Hold **R4** to pause gyro aiming; release to resume.
+4. Keep the app open while playing. Turn the mapper off before changing slots or saving
+   controller settings.
+
+### Limits
+
+- While R4 is held, the right stick comes from Bluetooth: 8-bit resolution and a lower update
+  rate (~31 ms). Firmware stick curves don't apply during that time.
+- Tune gyro sensitivity on the controller's **Motion** page; the app's raw-gyro filters don't
+  apply to this mode.
+- On Windows, output is an Xbox 360 pad only: no keyboard/mouse destinations, independent
+  extra-paddle outputs, rumble, firmware-mouse capture or automatic profile switching.
+- HidHide cannot block every Raw Input reader. If a game sees two controllers, check HidHide
+  and the game's input settings.
+- **Crash recovery:** HidHide changes are journaled in
+  `%APPDATA%\ultimate-control\hidhide-journal.json` and undone on the next start. If HidHide
+  settings were edited meanwhile, the app refuses to overwrite them; unhide the controller in
+  HidHide manually.
+
+### Troubleshooting
+
+- **Connect Bluetooth fails:** hold the profile button 3 seconds again until the LEDs blink,
+  close other 8BitDo apps, then retry within 20 seconds.
+- **Mapper won't start:** close the HidHide client; confirm ViGEmBus and HidHide are installed;
+  read the error on Home.
+- **Gyro does nothing:** check PC mode, the selected slot, Motion target Right stick, and press PL once.
+- **R4 also presses a button in game:** R4 is still mapped in the controller slot; set it to
+  None and save.
+
+Technical details on the Windows backend, driver handling and building the `.exe` yourself are
+in [build-windows](#build-windows).
 
 ## Status
 
