@@ -501,10 +501,12 @@ fn worker(commands:Rx<Command>,events:Sender<Event>,pad:Arc<Mutex<Option<PadSamp
             send_event(&events,Event::Mapper(false,result.err().map_or_else(||"Host mapper stopped.".into(),|error|format!("Host mapper stopped: {error}"))));
         }
         let now=Instant::now();
-        #[cfg(target_os = "linux")]
         if auto.is_some()&&mapper.is_some()&&now>=auto_next{
             auto_next=now+Duration::from_secs(1);
+            #[cfg(target_os = "linux")]
             let processes=profiles::collect_processes(Path::new("/proc"),unsafe{libc::getuid()});
+            #[cfg(target_os = "windows")]
+            let processes=profiles::collect_processes();
             match prepare_auto_switch(&mut auto,mapper_device.as_ref().map(|device|device.link),&store,now.saturating_duration_since(auto_epoch),&processes){
                 Ok(Some((target,profile)))=>{
                     let mut previous=mapper.take().expect("running mapper");
@@ -552,10 +554,7 @@ fn worker(commands:Rx<Command>,events:Sender<Event>,pad:Arc<Mutex<Option<PadSamp
         match command{
             Ok(Command::Shutdown)|Err(mpsc::RecvTimeoutError::Disconnected)=>break,
             Ok(Command::Auto(selection))=>{
-                #[cfg(target_os = "linux")]
-                { auto=selection.map(|(config,current)|AutoState::new(config,current));auto_next=Instant::now(); }
-                #[cfg(target_os = "windows")]
-                if selection.is_some(){send_event(&events,Event::Error("Process-based profile switching is not yet supported on Windows".into()));}
+                auto=selection.map(|(config,current)|AutoState::new(config,current));auto_next=Instant::now();
             },
             Ok(Command::TestVisible(visible))=>{
                 test_visible=visible;next_test_open=Instant::now();test_error=None;

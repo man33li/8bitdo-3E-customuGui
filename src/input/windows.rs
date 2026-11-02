@@ -37,14 +37,18 @@ fn receiver_pad(mapper: &mut super::Mapper, pad: crate::receiver::Pad, now: std:
     mapper.receiver_event(Event::default(), now)
 }
 
-pub(super) fn validate_profile(profile: &HostProfile, link: super::LinkKind) -> Result<()> {
+/// Xbox 360 button codes ViGEm can represent.
+const XBOX: [u16; 11] = [304, 305, 307, 308, 310, 311, 314, 315, 316, 317, 318];
+/// No receiver heartbeat is sent on Windows (its effect there is unverified), so firmware keeps
+/// applying the slot mapping; Mapper::new_receiver without a slot map leaves those buttons as-is.
+pub(super) const USB_NOTICE: &str = "Windows PC-mode USB: the controller slot's own button mapping stays active and host mappings apply on top of it. L4/R4/PL/PR reach the host only as the buttons the slot maps them to; host gyro needs the native-stick clutch.";
+
+pub(super) fn validate_profile(profile: &HostProfile, link: super::LinkKind) -> Result<Option<&'static str>> {
     if profile.receiver_gyro {
         return Err(invalid("Windows does not support firmware mouse gyro; use native right-stick gyro"));
     }
-    if profile.steam || profile.gyro_mouse.is_some() || profile.stick_mouse.is_some()
-        || profile.layers.iter().any(|layer| layer.stick_mouse.is_some())
-    {
-        return Err(invalid("Windows supports Xbox gamepad output only, not Steam or mouse output"));
+    if profile.steam {
+        return Err(invalid("Steam Input output (virtual DualSense Edge) is Linux-only"));
     }
     for destination in profile.mappings.values()
         .chain([&profile.trigger_buttons.left, &profile.trigger_buttons.right].into_iter().flatten().map(|trigger| &trigger.destination))
@@ -52,17 +56,16 @@ pub(super) fn validate_profile(profile: &HostProfile, link: super::LinkKind) -> 
             [&layer.trigger_buttons.left, &layer.trigger_buttons.right].into_iter().flatten().map(|trigger| &trigger.destination))))
     {
         let code = super::key_code(destination)?;
-        if ![304, 305, 307, 308, 310, 311, 314, 315, 316, 317, 318].contains(&code) {
-            return Err(invalid(format!("Windows Xbox output cannot represent destination {destination}")));
+        if !XBOX.contains(&code) && output::target(code).is_none() {
+            return Err(invalid(format!("Windows output cannot represent destination {destination}")));
         }
     }
     let check_controls = |mappings: &std::collections::BTreeMap<String, String>,
         turbo: &std::collections::BTreeMap<String, f64>, toggle: &[String]| -> Result<()> {
         for source in turbo.keys().chain(toggle.iter()) {
             let code = super::key_code(source)?;
-            if ![304, 305, 307, 308, 310, 311, 314, 315, 316, 317, 318].contains(&code)
-                && !mappings.keys().any(|mapped| super::key_code(mapped).ok() == Some(code)) {
-                return Err(invalid(format!("Windows Xbox output requires a gamepad mapping for turbo/toggle source {source}")));
+            if !XBOX.contains(&code) && !mappings.keys().any(|mapped| super::key_code(mapped).ok() == Some(code)) {
+                return Err(invalid(format!("Windows output requires a mapping for turbo/toggle source {source}")));
             }
         }
         Ok(())
@@ -78,7 +81,7 @@ pub(super) fn validate_profile(profile: &HostProfile, link: super::LinkKind) -> 
     if link == super::LinkKind::Wired {
         return Err(invalid("Windows wired GIP input is not supported; select PC-mode USB or Bluetooth"));
     }
-    Ok(())
+    Ok((link == super::LinkKind::Receiver && !profile.native_gyro_clutch).then_some(USB_NOTICE))
 }
 
 pub fn devices() -> Result<Vec<DeviceInfo>> {
@@ -160,7 +163,7 @@ pub fn run(device: Option<&Path>, profile: &HostProfile, slot_map: Option<crate:
     mapper.set_key_map(slot_map);
     let mut output = output::VirtualPad::create(super::LinkKind::Bluetooth)?;
     if stopped.load(Ordering::Acquire) || crate::interrupted() { return Ok(()); }
-    let mut guard = hide::acquire(&ids)?;
+    let guard = hide::acquire(&ids)?;
     let result = (|| {
         output.send(&mapper.physical_input_at(first, mapper.origin.elapsed()))?;
         drain_physical(&mut mapper, &mut output, &physical, false)?;
@@ -181,6 +184,11 @@ pub fn run(device: Option<&Path>, profile: &HostProfile, slot_map: Option<crate:
         }
         Ok(())
     })();
+    finish(result, output, guard)
+}
+
+/// Release virtual output before restoring HidHide, so games never see both pads.
+fn finish(result: Result<()>, output: output::VirtualPad, mut guard: hide::Guard) -> Result<()> {
     drop(output);
     let cleanup = guard.cleanup();
     match (result, cleanup) {
@@ -190,27 +198,32 @@ pub fn run(device: Option<&Path>, profile: &HostProfile, slot_map: Option<crate:
     }
 }
 
+fn first_pad(receiver: &mut crate::receiver::Receiver, stopped: &AtomicBool) -> Result<Option<crate::receiver::Pad>> {
+    use std::{sync::atomic::Ordering, time::{Duration, Instant}};
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if stopped.load(Ordering::Acquire) || crate::interrupted() { return Ok(None); }
+        if Instant::now() >= deadline { return Err(invalid("No PC-mode receiver input report received within two seconds")); }
+        if let Some(pad) = receiver.input(Duration::from_millis(5))?.0 { return Ok(Some(pad)); }
+    }
+}
+
 pub fn run_native_clutch(device: Option<&Path>, profile: &HostProfile,
     physical: Receiver<PhysicalInput>, stopped: Arc<AtomicBool>) -> Result<()> {
-    use std::{sync::atomic::Ordering, time::{Duration, Instant}};
+    use std::{sync::atomic::Ordering, time::Duration};
     profile.validate_runtime(super::LinkKind::Receiver)?;
     if !profile.native_gyro_clutch { return Err(invalid("Native gyro clutch is not enabled")); }
     hide::check_available()?;
     let source = select(device, inventory::Kind::Receiver)?;
     let Some(first) = first_physical(&physical, &stopped)? else { return Ok(()); };
     let mut receiver = crate::receiver::Receiver::open(&source.path)?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let first_pad = loop {
-        if stopped.load(Ordering::Acquire) || crate::interrupted() { return Ok(()); }
-        if Instant::now() >= deadline { return Err(invalid("No PC-mode receiver input report received within two seconds")); }
-        if let Some(pad) = receiver.input(Duration::from_millis(5))?.0 { break pad; }
-    };
+    let Some(first_pad) = first_pad(&mut receiver, &stopped)? else { return Ok(()); };
     let ids = inventory::safe_hide_ids(&source)?;
     let first = newest_physical(&physical, first)?;
     let mut mapper = super::Mapper::new_receiver(profile, receiver_axes())?;
     let mut output = output::VirtualPad::create(super::LinkKind::Receiver)?;
     if stopped.load(Ordering::Acquire) || crate::interrupted() { return Ok(()); }
-    let mut guard = hide::acquire(&ids)?;
+    let guard = hide::acquire(&ids)?;
     let result = (|| {
         output.send(&mapper.native_physical_at(first, mapper.origin.elapsed())?)?;
         drain_physical(&mut mapper, &mut output, &physical, true)?;
@@ -228,22 +241,38 @@ pub fn run_native_clutch(device: Option<&Path>, profile: &HostProfile,
         }
         Ok(())
     })();
-    drop(output);
-    let cleanup = guard.cleanup();
-    match (result, cleanup) {
-        (Err(error), Err(cleanup)) => Err(invalid(format!("{error}; HidHide cleanup failed: {cleanup}"))),
-        (Err(error), _) => Err(error),
-        (_, cleanup) => cleanup,
-    }
+    finish(result, output, guard)
 }
 
-pub fn run_receiver(
-    _device: Option<&Path>,
-    _profile: &HostProfile,
-    _slot_map: Option<crate::profile::KeyMap>,
-    _stopped: Arc<AtomicBool>,
-) -> Result<()> {
-    Err(invalid("Receiver input mapping not yet supported on Windows"))
+/// PC-mode USB (cable or 2.4 GHz receiver) host remapping without configuration BLE.
+pub fn run_receiver(device: Option<&Path>, profile: &HostProfile,
+    _slot_map: Option<crate::profile::KeyMap>, stopped: Arc<AtomicBool>) -> Result<()> {
+    use std::{sync::atomic::Ordering, time::Duration};
+    profile.validate_runtime(super::LinkKind::Receiver)?;
+    if profile.native_gyro_clutch { return Err(invalid("Native gyro clutch requires configuration BLE")); }
+    hide::check_available()?;
+    let source = select(device, inventory::Kind::Receiver)?;
+    let mut receiver = crate::receiver::Receiver::open(&source.path)?;
+    let Some(first_pad) = first_pad(&mut receiver, &stopped)? else { return Ok(()); };
+    let ids = inventory::safe_hide_ids(&source)?;
+    // No slot map: see USB_NOTICE; firmware already applied it to these reports.
+    let mut mapper = super::Mapper::new_receiver(profile, receiver_axes())?;
+    let mut output = output::VirtualPad::create(super::LinkKind::Receiver)?;
+    if stopped.load(Ordering::Acquire) || crate::interrupted() { return Ok(()); }
+    let guard = hide::acquire(&ids)?;
+    let result = (|| {
+        let now = mapper.origin.elapsed();
+        output.send(&receiver_pad(&mut mapper, first_pad, now)?)?;
+        while !stopped.load(Ordering::Acquire) && !crate::interrupted() {
+            if let Some(pad) = receiver.input(Duration::from_millis(5))?.0 {
+                let now = mapper.origin.elapsed();
+                output.send(&receiver_pad(&mut mapper, pad, now)?)?;
+            }
+            output.send(&mapper.tick(mapper.origin.elapsed()))?;
+        }
+        Ok(())
+    })();
+    finish(result, output, guard)
 }
 
 pub fn run_wired(
@@ -294,15 +323,25 @@ mod tests {
     }
 
     #[test]
-    fn windows_rejects_non_xbox_destinations_before_open() {
+    fn windows_accepts_xbox_and_desktop_destinations_only() {
+        use super::super::LinkKind::{Bluetooth, Receiver, Wired};
         let mut profile = HostProfile::default();
         profile.mappings.insert("BTN_SOUTH".into(), "KEY_A".into());
-        assert!(validate_profile(&profile, super::super::LinkKind::Bluetooth).is_err());
-        profile.mappings.insert("BTN_SOUTH".into(), "BTN_EAST".into());
-        assert!(validate_profile(&profile, super::super::LinkKind::Bluetooth).is_ok());
+        profile.trigger_buttons.right = Some(super::super::TriggerButton { destination: "BTN_LEFT".into(), threshold: 0.5 });
+        profile.stick_mouse = Some(super::super::StickMouse { stick: super::super::Stick::Right, sensitivity: 1000.0, deadzone: 0.15 });
+        assert_eq!(validate_profile(&profile, Bluetooth).unwrap(), None);
+        assert_eq!(validate_profile(&profile, Receiver).unwrap(), Some(USB_NOTICE));
+        assert!(validate_profile(&profile, Wired).is_err());
+        for unrepresentable in ["BTN_TRIGGER_HAPPY3", "KEY_LINEFEED", "BTN_FORWARD"] {
+            let mut bad = profile.clone();
+            bad.mappings.insert("BTN_EAST".into(), unrepresentable.into());
+            assert!(validate_profile(&bad, Bluetooth).is_err(), "{unrepresentable}");
+        }
         profile.turbo.insert("BTN_TRIGGER_HAPPY1".into(), 10.0);
-        assert!(validate_profile(&profile, super::super::LinkKind::Bluetooth).is_err());
-        profile.mappings.insert("BTN_TRIGGER_HAPPY1".into(), "BTN_A".into());
-        assert!(validate_profile(&profile, super::super::LinkKind::Bluetooth).is_ok());
+        assert!(validate_profile(&profile, Bluetooth).is_err(), "an unmapped paddle has no Windows output");
+        profile.mappings.insert("BTN_TRIGGER_HAPPY1".into(), "KEY_SPACE".into());
+        assert!(validate_profile(&profile, Bluetooth).is_ok());
+        profile.steam = true;
+        assert!(validate_profile(&profile, Bluetooth).is_err());
     }
 }

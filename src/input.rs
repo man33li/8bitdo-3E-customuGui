@@ -589,7 +589,7 @@ impl HostProfile {
     pub fn validate_runtime(&self, link: LinkKind) -> Result<Option<&'static str>> {
         let notice = self.validate_for_link(link)?;
         #[cfg(target_os = "windows")]
-        windows::validate_profile(self, link)?;
+        let notice = windows::validate_profile(self, link)?.or(notice);
         Ok(notice)
     }
 

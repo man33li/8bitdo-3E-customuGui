@@ -78,14 +78,38 @@ Windows security features. Reboot if a driver installer asks for it.
 4. Keep the app open while playing. Turn the mapper off before changing slots or saving
    controller settings.
 
+### Host remapping (keyboard, mouse, turbo, layers)
+
+The host mapper also works on Windows without the gyro clutch: over USB cable or the 2.4 GHz
+receiver (PC mode), and over Bluetooth gaming mode. It needs the same ViGEmBus and HidHide
+drivers. Bluetooth settings are optional for plain USB remapping.
+
+1. Open **Remap**. Leave the native-stick clutch off unless you also want the gyro clutch.
+2. Choose a source button and type a destination: an Xbox button (`BTN_SOUTH` = A,
+   `BTN_EAST` = B, `BTN_NORTH` = X, `BTN_WEST` = Y), a keyboard key (`KEY_SPACE`, `KEY_W`,
+   `KEY_LEFTSHIFT`, `KEY_F1`…) or a mouse button (`BTN_LEFT`, `BTN_RIGHT`, `BTN_MIDDLE`,
+   `BTN_SIDE`, `BTN_EXTRA`).
+3. Optionally enable **Turbo**, **Toggle / latch**, **Stick to mouse**, **Trigger to button**
+   or a **layer**.
+4. Click **Save host profile**, then turn on **Home → Host input mapper**.
+5. Optional: on **Host profiles**, add rules such as `game.exe` → profile and enable
+   **Auto-switch**. Windows matches executable names (`game` or `game.exe`) of programs in
+   your session; command-line rules are Linux-only.
+
+Over USB/2.4 GHz on Windows, the controller slot's own button mapping stays active and host
+mappings apply on top of it. L4/R4/PL/PR reach the host only as the buttons the slot maps
+them to (map R4 → R3 in the slot, then remap R3 on the host). Keys and mouse buttons held
+when the mapper stops are released. Games running as administrator only receive
+keyboard/mouse output if Ultimate Control also runs as administrator (Windows UIPI).
+
 ### Limits
 
 - While R4 is held, the right stick comes from Bluetooth: 8-bit resolution and a lower update
   rate (~31 ms). Firmware stick curves don't apply during that time.
 - Tune gyro sensitivity on the controller's **Motion** page; the app's raw-gyro filters don't
   apply to this mode.
-- On Windows, output is an Xbox 360 pad only: no keyboard/mouse destinations, independent
-  extra-paddle outputs, rumble, firmware-mouse capture or automatic profile switching.
+- On Windows, gamepad output is a virtual Xbox 360 controller plus keyboard/mouse; no
+  independent extra-paddle outputs, rumble, firmware-mouse capture or Steam Input mode.
 - HidHide cannot block every Raw Input reader. If a game sees two controllers, check HidHide
   and the game's input settings.
 - **Crash recovery:** HidHide changes are journaled in
@@ -234,8 +258,9 @@ accepted. Real Windows 11 hardware use was verified for the native-stick clutch 
 Windows right-stick output is implemented for gaming Bluetooth and Bluetooth-assisted
 PC-mode USB/cable/receiver clutch. It requires **ViGEmBus and HidHide**; neither is bundled
 or installed automatically. Verified on a real Windows PC with the controller and both drivers.
-Firmware-mouse capture, keyboard/mouse destinations, independent extra-paddle output,
-Xbox-mode GIP, rumble and automatic profile switching remain unavailable on Windows.
+Keyboard/mouse destinations, stick/gyro mouse, USB remapping and automatic profile switching
+are supported. Firmware-mouse capture, Steam Input mode, independent extra-paddle output,
+Xbox-mode GIP and rumble remain unavailable on Windows.
 The GUI hides the PC→Xbox switch on Windows, because switching back currently requires Linux.
 Bluetooth `scan` shows empty `adapter_address`/`adapter_address_type` (WinRT doesn't report the
 adapter). No driver replacement or administrator token is needed for HID.
@@ -461,17 +486,18 @@ ultimate-control gui --demo --page Test --assets /path/to/Assets --screenshot /t
 Resolution selects the first valid directory: `--assets DIR`, then `ULTIMATE_ASSETS`, then
 **Settings → Original artwork → Save artwork folder**, then automatic probes. The setting is
 `assets.json` beside the host settings (`$XDG_CONFIG_HOME/ultimate-control`, otherwise
-`~/.config/ultimate-control` on Linux; `%LOCALAPPDATA%\ultimate-control` on Windows).
+`~/.config/ultimate-control` on Linux; `%APPDATA%\ultimate-control` on Windows).
 Blanking the field restores automatic discovery; command-line/environment overrides still win.
 Invalid, missing, inaccessible or incomplete directories are skipped without an error dialog.
 Missing/corrupt individual images use the generic illustration or existing text indicators.
 PNG decoding/upload happens once per requested image per loaded root; failures are cached too.
 
 Linux probes executable ancestors for `reconstruction/original/Assets`, then
-`~/.local/share/ultimate-control/Assets`. Windows probes matching
-`C:\Program Files\WindowsApps\*8BitDo*UltimateSoftwareX*\Assets` packages (read-only; denied
-access is harmless), then `%LOCALAPPDATA%\ultimate-control\Assets`. If WindowsApps is
-ACL-restricted, point to an accessible copy you own; do not change its permissions for this app.
+`~/.local/share/ultimate-control/Assets`. Windows finds an installed **8BitDo Ultimate Software
+X** from the Microsoft Store automatically (package `E0680B27.8BitDoUltimateSoftware`, located
+through the per-user package registry, so no administrator rights are needed), then
+`%LOCALAPPDATA%\ultimate-control\Assets`. Without the Store app, copy its `Assets` folder there
+or choose it in **Settings → Original artwork**. Do not change WindowsApps permissions.
 
 Home/Mapping use `XboxWired/mapping/Mapping_bg_L7.png` (Mapping's Back view:
 `Mapping_back_L7.png`), not the similarly named Ultimate 3 images. Mapping rows show

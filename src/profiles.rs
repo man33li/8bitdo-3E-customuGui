@@ -54,6 +54,37 @@ pub fn collect_processes(root:&Path,uid:u32)->Vec<Process>{
         Some(Process{comm,exe,cmdline})
     }).collect()
 }
+/// Processes in this desktop session. comm is the executable name without `.exe`.
+/// shortcut: cmdline stays empty (needs reading other processes' memory); rules match
+/// executable names only on Windows until command-line rules are needed there.
+#[cfg(target_os = "windows")]
+pub fn collect_processes()->Vec<Process>{
+    use windows::Win32::{Foundation::CloseHandle,System::{Diagnostics::ToolHelp::*,RemoteDesktop::ProcessIdToSessionId,Threading::GetCurrentProcessId}};
+    let mut processes=Vec::new();
+    let mut session=0;
+    // SAFETY: the snapshot handle is closed below; entry.dwSize is set as the API requires.
+    unsafe{
+        if ProcessIdToSessionId(GetCurrentProcessId(),&mut session).is_err(){return processes;}
+        let Ok(snapshot)=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0)else{return processes};
+        let mut entry=PROCESSENTRY32W{dwSize:size_of::<PROCESSENTRY32W>() as u32,..Default::default()};
+        let mut more=Process32FirstW(snapshot,&mut entry).is_ok();
+        while more{
+            let mut owner=u32::MAX;
+            if ProcessIdToSessionId(entry.th32ProcessID,&mut owner).is_ok()&&owner==session{
+                let length=entry.szExeFile.iter().position(|&unit|unit==0).unwrap_or(entry.szExeFile.len());
+                let exe=String::from_utf16_lossy(&entry.szExeFile[..length]);
+                let comm=match exe.len().checked_sub(4){
+                    Some(stem) if exe.is_char_boundary(stem)&&exe[stem..].eq_ignore_ascii_case(".exe")=>exe[..stem].to_owned(),
+                    _=>exe.clone(),
+                };
+                processes.push(Process{comm,exe,cmdline:String::new()});
+            }
+            more=Process32NextW(snapshot,&mut entry).is_ok();
+        }
+        let _=CloseHandle(snapshot);
+    }
+    processes
+}
 /// A new target must remain selected for two seconds; unchanged targets never restart.
 #[derive(Default)]
 pub struct Debounce { pending:Option<(String,Duration)> }
@@ -171,6 +202,16 @@ mod tests {
         assert_eq!(select(&[rule("comm","gAmE")],&processes),Some("comm"));
         assert_eq!(select(&[rule("not-substring","aunch")],&processes),None);
         assert_eq!(select(&[rule("empty","")],&processes),None);
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_processes_include_this_session_by_executable_name(){
+        let exe=std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        let processes=collect_processes();
+        let this=processes.iter().find(|process|process.exe.eq_ignore_ascii_case(&exe)).expect("current process is in this session");
+        assert!(this.comm.len()+4==exe.len()&&exe.to_ascii_lowercase().ends_with(".exe"));
+        let rule=Rule{profile:"p".into(),process:exe};
+        assert!(matching_rule(std::slice::from_ref(&rule),&processes).is_some());
     }
     #[cfg(target_os = "linux")]
     #[test]

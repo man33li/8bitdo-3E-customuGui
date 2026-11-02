@@ -35,14 +35,15 @@ fn probes() -> Vec<PathBuf> {
     }
     #[cfg(target_os = "windows")]
     {
+        paths.extend(store_packages());
+        // Listing WindowsApps needs administrator rights; works only when allowed.
         let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
         if let Ok(entries) = fs::read_dir(program_files.join("WindowsApps")) {
-            let mut packages: Vec<_> = entries.flatten().filter(|entry| {
-                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-                name.contains("8bitdo") && name.contains("ultimatesoftwarex")
-            }).map(|entry| entry.path().join("Assets")).collect();
-            packages.sort();
+            let mut packages: Vec<_> = entries.flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase().starts_with(STORE_PACKAGE))
+                .map(|entry| entry.path().join("Assets")).collect();
+            packages.sort_unstable_by(|a, b| b.cmp(a));
             paths.extend(packages);
         }
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
@@ -50,6 +51,41 @@ fn probes() -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+/// Package identity from Ultimate Software X 1.4.9.0's AppxManifest (`Identity Name`).
+#[cfg(target_os = "windows")]
+const STORE_PACKAGE: &str = "e0680b27.8bitdoultimatesoftware_";
+
+/// Installed package roots from the per-user AppModel repository, newest version first.
+#[cfg(target_os = "windows")]
+fn store_packages() -> Vec<PathBuf> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    use windows::{core::{PCWSTR, PWSTR, w}, Win32::System::Registry::*};
+    let mut roots = Vec::new();
+    let mut key = HKEY::default();
+    // SAFETY: key is closed below; name/root buffers outlive each call and their sizes are passed.
+    unsafe {
+        if RegOpenKeyExW(HKEY_CURRENT_USER,
+            w!(r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages"),
+            None, KEY_READ, &mut key).is_err() { return roots; }
+        let mut name = [0u16; 256];
+        for index in 0u32.. {
+            let mut length = name.len() as u32;
+            if RegEnumKeyExW(key, index, Some(PWSTR(name.as_mut_ptr())), &mut length, None, None, None, None).is_err() { break; }
+            if !String::from_utf16_lossy(&name[..length as usize]).to_ascii_lowercase().starts_with(STORE_PACKAGE) { continue; }
+            let mut root = [0u16; 1024];
+            let mut bytes = size_of_val(&root) as u32;
+            if RegGetValueW(key, PCWSTR(name.as_ptr()), w!("PackageRootFolder"), RRF_RT_REG_SZ, None,
+                Some(root.as_mut_ptr().cast()), Some(&mut bytes)).is_ok() {
+                let length = (bytes as usize / 2).saturating_sub(1);
+                roots.push(PathBuf::from(OsString::from_wide(&root[..length])).join("Assets"));
+            }
+        }
+        let _ = RegCloseKey(key);
+    }
+    roots.sort_unstable_by(|a, b| b.cmp(a));
+    roots
 }
 
 #[derive(Default, Deserialize, Serialize)]
